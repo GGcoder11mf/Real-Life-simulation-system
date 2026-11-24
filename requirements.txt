@@ -1,0 +1,6 @@
+numpy>=1.26
+numba>=0.59
+torch>=2.2
+pygame>=2.5
+msgpack>=1.0
+windows-curses>=2.3; sys_platform == "win32"

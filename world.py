@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import math
 import random
-from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+
+import buildings as bldg
+from routing import RouteService, make_entry_cost_grid
 
 TERRAIN_ORDER = [
     "water",
@@ -99,17 +102,73 @@ COMPANY_SECTORS = [
     "public_service",
 ]
 
-SAVE_FLOAT_DIGITS = 4
+SAVE_FLOAT_DIGITS = 6
+DEFAULT_WORLD_WIDTH = 224
+DEFAULT_WORLD_HEIGHT = 112
+DEFAULT_DENSITY = 1.15
+
+# Physical scale: one tile is 20 m x 20 m, so the large map is ~4.5 km x 2.2 km.
+TILE_METERS = 20.0
+SUBSTEP_MINUTES = 2
+SUBSTEPS_PER_HOUR = 60 // SUBSTEP_MINUTES
+# Travel modes (codes are stored on citizens and sent to the renderer).
+MODE_WALK, MODE_BIKE, MODE_CAR, MODE_BUS, MODE_TAXI = 0, 1, 2, 3, 4
+MODE_NAMES = ["walk", "bike", "car", "bus", "taxi"]
+MODE_KMH = [4.8, 14.0, 38.0, 22.0, 40.0]        # free-flow speeds between signals (stops add delay)
+MODE_FATIGUE = [0.0004, 0.00015, 0.0, 0.00003, 0.0]   # energy lost per tile travelled
+MODE_TRAFFIC_EXP = [0.0, 0.35, 1.0, 0.8, 1.0]
+
+
+# Traffic signals: one shared timing function used by both the simulation (vehicles
+# stop on red) and the renderer (the lights shown).  Time is simulated seconds.
+SIGNAL_CYCLE = 120.0
+SIGNAL_GREEN = 52.0
+SIGNAL_YELLOW = 6.0
+
+
+def signal_state(jid: int, axis: int, t: float) -> int:
+    """0 green, 1 yellow, 2 red for traffic on `axis` (0 = north-south, 1 = east-west)."""
+    phase = (t + jid * 37.0) % SIGNAL_CYCLE
+    d = (phase - (0.0 if axis == 0 else SIGNAL_CYCLE / 2.0)) % SIGNAL_CYCLE
+    if d < SIGNAL_GREEN:
+        return 0
+    if d < SIGNAL_GREEN + SIGNAL_YELLOW:
+        return 1
+    return 2
+
+
+def time_to_green(jid: int, axis: int, t: float) -> float:
+    """Seconds until traffic on `axis` next has a green (0 if green now)."""
+    phase = (t + jid * 37.0) % SIGNAL_CYCLE
+    d = (phase - (0.0 if axis == 0 else SIGNAL_CYCLE / 2.0)) % SIGNAL_CYCLE
+    return 0.0 if d < SIGNAL_GREEN else SIGNAL_CYCLE - d
+
+
+def mode_speeds(traffic_factor: float = 1.0):
+    """Tiles per hour for each travel mode under a traffic factor."""
+    out = []
+    for kmh, exp in zip(MODE_KMH, MODE_TRAFFIC_EXP):
+        out.append(max(1.0, kmh * 1000.0 / TILE_METERS * (traffic_factor ** exp)))
+    return out
 TILE_FLAG_ROAD = 1
 TILE_FLAG_RAIL = 2
 TILE_FLAG_TRANSIT_STOP = 4
 TILE_TERRAIN_CODES = {name: idx for idx, name in enumerate(TERRAIN_ORDER)}
 TILE_ZONE_CODES = {name: idx for idx, name in enumerate(ZONE_TYPES)}
-ROUTE_CACHE_LIMIT = 2048
 
 
 def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+    return low if value < low else high if value > high else value
+
+
+def coerce_rng_state(state: Any) -> Any:
+    """msgpack turns the tuple returned by Random.getstate() into lists."""
+    if state is None:
+        return None
+    if isinstance(state, (list, tuple)) and len(state) == 3:
+        version, internal, gauss = state
+        return (int(version), tuple(int(value) for value in internal), gauss)
+    return state
 
 
 def round_for_save(value: float, digits: int = SAVE_FLOAT_DIGITS) -> float:
@@ -137,7 +196,6 @@ class Tile:
     transit_stop: bool = False
     landmark: Optional[str] = None
     building_id: Optional[int] = None
-    residents: List[int] = field(default_factory=list)
     occupants: List[int] = field(default_factory=list)
 
     def glyph(self) -> str:
@@ -221,6 +279,17 @@ class Building:
     open_hours: Tuple[int, int] = (8, 18)
     inventory_pressure: float = 0.0
     maintenance_backlog: float = 0.0
+    floors: int = 1
+    units_per_floor: int = 1
+    owner_id: Optional[int] = None
+    owner_kind: str = "developer"      # person | developer | company | city
+    value: float = 0.0
+    maintenance_fund: float = 0.0
+    anchor_x: int = -1          # top-left tile of the footprint (-1 = legacy single tile)
+    anchor_y: int = -1
+    width_tiles: int = 1
+    height_tiles: int = 1
+    facing: int = 0             # side that faces the street: 0 N, 1 E, 2 S, 3 W
 
     def residential_capacity(self) -> int:
         if self.building_type in {"house", "apartment"}:
@@ -313,6 +382,10 @@ class HousingListing:
     bedrooms: int
     occupied: bool = False
     household_id: Optional[int] = None
+    floor: int = 0
+    unit_no: int = 1
+    tenure: str = "rent"               # rent | own
+    owner_id: Optional[int] = None     # landlord, or the occupant for owned units
 
 
 @dataclass
@@ -338,6 +411,11 @@ class EconomySnapshot:
     housing_index: float
     transit_index: float
     crime_index: float
+    labor_force: int = 0
+    employed: int = 0
+    unemployed: int = 0
+    vacancies: int = 0
+    rent_index: float = 0.0
 
 
 class WorldMap:
@@ -350,10 +428,37 @@ class WorldMap:
     structure on top of which the life simulation runs.
     """
 
-    def __init__(self, seed: int, width: int = 96, height: int = 48) -> None:
+    def __init__(self, seed: int, width: int = DEFAULT_WORLD_WIDTH, height: int = DEFAULT_WORLD_HEIGHT, density: Optional[float] = None) -> None:
+        self._initialize_fields(seed, width, height, density)
+        self.generate_world()
+        self._build_routing_arrays()
+
+    @classmethod
+    def _empty(cls, seed: int, width: int = DEFAULT_WORLD_WIDTH, height: int = DEFAULT_WORLD_HEIGHT, density: Optional[float] = None) -> "WorldMap":
+        """Create an ungenerated world shell for save loading."""
+        world = cls.__new__(cls)
+        world._initialize_fields(seed, width, height, density)
+        return world
+
+    def _initialize_fields(self, seed: int, width: int, height: int, density: Optional[float] = None) -> None:
         self.seed = seed
         self.width = width
         self.height = height
+        # Linear tile scale relative to the original 96x48 map.  Finer grids
+        # keep the same real-world speeds by scaling tiles-per-hour with it.
+        self.tile_scale = max(0.5, width / 96.0)
+        self.traffic_factor = 1.0
+        self.mode_tph = mode_speeds(1.0)
+        self.mode_step = [t / SUBSTEPS_PER_HOUR for t in self.mode_tph]   # tiles per 2-minute sub-step
+        self.movers: set = set()
+        self.sim_seconds = 0.0
+        self.signal_boxes: List[Tuple[int, int, int, int]] = []
+        self.signal_grid: List[List[int]] = []
+        self.bad_weather = False
+        self.taxi_revenue_today = 0.0
+        self.aqi_health_drain = 0.0
+        # Building density multiplier: finer tiles hold more (smaller) buildings.
+        self.density = float(density) if density is not None else (DEFAULT_DENSITY if width * height > 8000 else 1.0)
         self.rng = random.Random(seed)
         self.tiles: List[List[Tile]] = []
         self.districts: Dict[int, District] = {}
@@ -368,13 +473,17 @@ class WorldMap:
         self._walkable_tiles: List[Tile] = []
         self._district_tile_cache: Dict[int, List[Tile]] = {}
         self._building_type_index: Dict[str, List[Building]] = {}
-        self._route_cache: "OrderedDict[Tuple[Tuple[int, int], Tuple[int, int], int], Tuple[Tuple[int, int], ...]]" = OrderedDict()
+        self._park_tiles: List[Tuple[int, int]] = []
+        self.route_service: Optional[RouteService] = None
+        self._used_symbols: set = set()
+        self.inflation_rate = 0.025
+        self._building_listings: Dict[int, List[HousingListing]] = {}
+        self.structure_version = 0
         self._building_counter = 1
         self._company_counter = 1
         self._listing_counter = 1
         self._posting_counter = 1
         self._line_counter = 1
-        self.generate_world()
 
     # ------------------------------------------------------------------
     # World generation
@@ -384,28 +493,72 @@ class WorldMap:
         self._generate_districts()
         self._lay_roads()
         self._lay_transit()
+        self._compute_signals()
         self._assign_zones()
         self._stamp_landmarks()
         self._generate_buildings()
         self._generate_companies()
         self._generate_housing_market()
+        self._balance_housing()
         self._generate_job_market()
+        self._assign_building_structure()
         self._recalculate_all_tile_values()
         self._rebuild_spatial_indexes()
         self.record_economy_snapshot(0)
 
+    def _index_listings(self) -> None:
+        index: Dict[int, List[HousingListing]] = {}
+        for listing in self.housing_market.values():
+            index.setdefault(listing.building_id, []).append(listing)
+        for bid, items in index.items():
+            items.sort(key=lambda l: l.listing_id)
+        self._building_listings = index
+
+    def _assign_building_structure(self) -> None:
+        """Give every building floors, place units on floors, and set its value."""
+        self._index_listings()
+        for building in self.buildings.values():
+            listings = self._building_listings.get(building.building_id, [])
+            building.floors = bldg.initial_floors(building, listings, self.rng)
+            if building.building_type in ("house", "apartment"):
+                bldg.assign_residential_units(building, listings)
+            if building.building_type in ("police", "court", "prison", "station", "school", "college", "hospital", "park_facility"):
+                building.owner_kind = "city" if building.building_type != "hospital" else "city"
+        bldg.refresh_structure(self, immediate=True)
+
     def _rebuild_spatial_indexes(self) -> None:
+        self._index_listings()
         self._walkable_tiles = []
         self._district_tile_cache = {district_id: [] for district_id in self.districts}
+        self._park_tiles = []
         for row in self.tiles:
             for tile in row:
                 if tile.is_walkable():
                     self._walkable_tiles.append(tile)
                 self._district_tile_cache.setdefault(tile.district_id, []).append(tile)
+                if tile.terrain == "park":
+                    self._park_tiles.append((tile.x, tile.y))
         self._building_type_index = {building_type: [] for building_type in BUILDING_TYPES}
         for building in self.buildings.values():
             self._building_type_index.setdefault(building.building_type, []).append(building)
-        self._route_cache.clear()
+
+    def _build_routing_arrays(self) -> None:
+        walkable, cost, vcost = make_entry_cost_grid(self.tiles)
+        if self.route_service is None:
+            self.route_service = RouteService(walkable, cost, vcost)
+        else:
+            self.route_service.invalidate(walkable, cost, vcost)
+        self.route_service.precompute_goals(self._popular_route_goals())
+
+    def _popular_route_goals(self) -> List[Tuple[int, int]]:
+        """Destinations citizens commonly route to: buildings, parks, transit."""
+        goals = {(int(b.tile[0]), int(b.tile[1])) for b in self.buildings.values()}
+        goals.update((int(x), int(y)) for x, y in self._park_tiles)
+        for row in self.tiles:
+            for tile in row:
+                if tile.transit_stop:
+                    goals.add((int(tile.x), int(tile.y)))
+        return list(goals)
 
     def _generate_base_tiles(self) -> List[List[Tile]]:
         grid: List[List[Tile]] = []
@@ -454,7 +607,7 @@ class WorldMap:
         return grid
 
     def _generate_districts(self) -> None:
-        district_total = max(12, (self.width * self.height) // 320)
+        district_total = max(12, (self.width * self.height) // 900)
         centers: List[Tuple[int, int]] = []
         for _ in range(district_total):
             centers.append((self.rng.randrange(self.width), self.rng.randrange(self.height)))
@@ -488,44 +641,103 @@ class WorldMap:
                 desirability=wealth,
             )
             self.districts[idx] = district
+        # Nearest-district assignment (Manhattan Voronoi), vectorised.
+        cx = np.array([c[0] for c in centers], dtype=np.int32)
+        cy = np.array([c[1] for c in centers], dtype=np.int32)
+        xs = np.arange(self.width, dtype=np.int32)[None, None, :]
+        ys = np.arange(self.height, dtype=np.int32)[None, :, None]
+        dist = np.abs(xs - cx[:, None, None]) + np.abs(ys - cy[:, None, None])
+        nearest = dist.argmin(axis=0) + 1  # district ids start at 1
+        self._district_map = nearest.astype(np.int32)
         for y in range(self.height):
+            row = self.tiles[y]
+            near_row = nearest[y]
             for x in range(self.width):
-                nearest = min(
-                    self.districts.values(),
-                    key=lambda district: abs(x - district.center[0]) + abs(y - district.center[1]),
-                )
-                tile = self.tiles[y][x]
-                tile.district_id = nearest.district_id
-                tile.wealth = clamp(nearest.wealth + self.rng.uniform(-0.18, 0.18), 0.0, 1.0)
-                tile.crime_pressure = clamp(nearest.crime_heat + self.rng.uniform(-0.15, 0.15), 0.0, 1.0)
+                district = self.districts[int(near_row[x])]
+                tile = row[x]
+                tile.district_id = district.district_id
+                tile.wealth = clamp(district.wealth + self.rng.uniform(-0.18, 0.18), 0.0, 1.0)
+                tile.crime_pressure = clamp(district.crime_heat + self.rng.uniform(-0.15, 0.15), 0.0, 1.0)
+
+    # Street lattice per terrain class: (spacing_x, spacing_y).  Dense blocks downtown,
+    # larger blocks in the suburbs and industrial estates, nothing in open country.
+    LATTICE = {"urban": (8, 7), "suburban": (12, 10), "industrial": (16, 12)}
 
     def _lay_roads(self) -> None:
-        x_roads = sorted({self.width // 4, self.width // 2, (self.width * 3) // 4})
-        y_roads = sorted({self.height // 4, self.height // 2, (self.height * 3) // 4})
+        """Arterials plus a street lattice whose block size depends on the area."""
+        W, H = self.width, self.height
+        x_roads = sorted({W // 4, W // 2, (W * 3) // 4})
+        y_roads = sorted({H // 4, H // 2, (H * 3) // 4})
         for x in x_roads:
-            for y in range(self.height):
+            for y in range(H):
                 tile = self.tiles[y][x]
                 if tile.terrain != "water":
                     tile.road = True
                     tile.movement_cost = min(tile.movement_cost, 0.75)
         for y in y_roads:
-            for x in range(self.width):
+            for x in range(W):
                 tile = self.tiles[y][x]
                 if tile.terrain != "water":
                     tile.road = True
                     tile.movement_cost = min(tile.movement_cost, 0.75)
-        for district in self.districts.values():
-            cx, cy = district.center
-            for x in range(min(cx, self.width // 2), max(cx, self.width // 2) + 1):
-                tile = self.tiles[cy][x]
-                if tile.terrain != "water":
+        for y in range(H):
+            row = self.tiles[y]
+            for x in range(W):
+                tile = row[x]
+                lattice = self.LATTICE.get(tile.terrain)
+                if lattice is None or tile.road:
+                    continue
+                district = self.districts.get(tile.district_id)
+                did = tile.district_id
+                sx = lattice[0] + did % 3 - 1
+                sy = lattice[1] + did % 2
+                cx, cy = district.center if district is not None else (0, 0)
+                if x % sx == cx % sx or y % sy == cy % sy:
                     tile.road = True
                     tile.movement_cost = min(tile.movement_cost, 0.8)
-            for y in range(min(cy, self.height // 2), max(cy, self.height // 2) + 1):
-                tile = self.tiles[y][cx]
-                if tile.terrain != "water":
-                    tile.road = True
-                    tile.movement_cost = min(tile.movement_cost, 0.8)
+
+    def _compute_signals(self) -> None:
+        """Find signalised junctions: clusters of road tiles with 3+ arms, at most 3x3 tiles."""
+        H, W = self.height, self.width
+        road = [[self.tiles[y][x].road for x in range(W)] for y in range(H)]
+
+        def arms(x: int, y: int) -> int:
+            n = 0
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H and road[ny][nx]:
+                    n += 1
+            return n
+
+        inter = [[road[y][x] and arms(x, y) >= 3 for x in range(W)] for y in range(H)]
+        seen = [[False] * W for _ in range(H)]
+        boxes: List[Tuple[int, int, int, int]] = []
+        for sy in range(H):
+            for sx in range(W):
+                if not inter[sy][sx] or seen[sy][sx]:
+                    continue
+                stack = [(sx, sy)]
+                seen[sy][sx] = True
+                x_lo = x_hi = sx
+                y_lo = y_hi = sy
+                while stack:
+                    cx, cy = stack.pop()
+                    x_lo, x_hi = min(x_lo, cx), max(x_hi, cx)
+                    y_lo, y_hi = min(y_lo, cy), max(y_hi, cy)
+                    for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                        if 0 <= nx < W and 0 <= ny < H and inter[ny][nx] and not seen[ny][nx]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+                if x_hi - x_lo <= 2 and y_hi - y_lo <= 2:
+                    boxes.append((x_lo, y_lo, x_hi, y_hi))
+        grid = [[0] * W for _ in range(H)]
+        for jid, (x_lo, y_lo, x_hi, y_hi) in enumerate(boxes, start=1):
+            for y in range(y_lo, y_hi + 1):
+                for x in range(x_lo, x_hi + 1):
+                    if inter[y][x]:
+                        grid[y][x] = jid
+        self.signal_boxes = boxes
+        self.signal_grid = grid
 
     def _lay_transit(self) -> None:
         main_stops_h = [(x, self.height // 2) for x in range(2, self.width - 2, max(6, self.width // 12))]
@@ -579,16 +791,45 @@ class WorldMap:
             tile.landmark = name
             self.landmarks.append((name, (x, y)))
 
+    # direction vectors for a lot's frontage: facing -> (road offset, depth step, width step)
+    _FRONTAGE = {
+        0: ((0, -1), (0, 1), (1, 0)),
+        1: ((1, 0), (-1, 0), (0, 1)),
+        2: ((0, 1), (0, -1), (1, 0)),
+        3: ((-1, 0), (1, 0), (0, 1)),
+    }
+
     def _generate_buildings(self) -> None:
-        for y in range(self.height):
-            for x in range(self.width):
+        """Place buildings on lots that front a street; large buildings span several tiles."""
+        H, W = self.height, self.width
+        lots: List[Tuple[int, int]] = []
+        for y in range(H):
+            for x in range(W):
                 tile = self.tiles[y][x]
-                if not tile.supports_building():
+                if tile.road or not tile.supports_building():
                     continue
-                if tile.road and self.rng.random() < 0.35:
-                    self._spawn_building_for_tile(tile)
-                elif not tile.road and self.rng.random() < 0.08:
-                    self._spawn_building_for_tile(tile)
+                if self._road_sides(x, y):
+                    lots.append((x, y))
+        self.rng.shuffle(lots)
+        scale = self.density / 1.15
+        fill = {"urban": 0.82, "suburban": 0.62, "industrial": 0.55, "rural": 0.08, "park": 0.05}
+        for x, y in lots:
+            tile = self.tiles[y][x]
+            if tile.building_id is not None or tile.road:
+                continue
+            if self.rng.random() > min(0.96, fill.get(tile.terrain, 0.3) * scale):
+                continue
+            btype = self._choose_building_type(tile)
+            if btype is None:
+                continue
+            sides = self._road_sides(x, y)
+            facing = sides[self.rng.randrange(len(sides))]
+            width, depth = self._footprint_for(btype, tile)
+            tiles = self._lot_tiles(x, y, facing, width, depth)
+            if tiles is None:
+                tiles = self._lot_tiles(x, y, facing, 1, 1)
+                width = depth = 1
+            self._spawn_building(tile, tiles, btype, facing)
         for district in self.districts.values():
             district.population_capacity = sum(self.buildings[b].residential_capacity() for b in district.building_ids)
             rents = [self.buildings[b].rent for b in district.building_ids if self.buildings[b].rent > 0]
@@ -596,25 +837,93 @@ class WorldMap:
             district.average_rent = sum(rents) / len(rents) if rents else 0.0
             district.average_home_price = sum(prices) / len(prices) if prices else 0.0
 
-    def _spawn_building_for_tile(self, tile: Tile) -> None:
+    def _road_sides(self, x: int, y: int) -> List[int]:
+        sides = []
+        for facing, ((dx, dy), _, _) in self._FRONTAGE.items():
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height and self.tiles[ny][nx].road:
+                sides.append(facing)
+        return sides
+
+    def _lot_tiles(self, x: int, y: int, facing: int, width: int, depth: int) -> Optional[List[Tuple[int, int]]]:
+        _, (ddx, ddy), (wdx, wdy) = self._FRONTAGE[facing]
+        tiles = []
+        for k in range(width):
+            for j in range(depth):
+                tx = x + wdx * k + ddx * j
+                ty = y + wdy * k + ddy * j
+                if not (0 <= tx < self.width and 0 <= ty < self.height):
+                    return None
+                t = self.tiles[ty][tx]
+                if t.road or t.building_id is not None or not t.supports_building():
+                    return None
+                tiles.append((tx, ty))
+        return tiles
+
+    def _footprint_for(self, btype: str, tile: Tile) -> Tuple[int, int]:
+        r = self.rng.random()
+        wealth = self.districts[tile.district_id].wealth
+        if btype == "apartment":
+            return (2, 1) if r < 0.35 else (1, 1)
+        if btype == "shop":
+            return (2, 1) if r < 0.3 else (1, 1)
+        if btype == "office":
+            if r < 0.30 + wealth * 0.3:
+                return (2, 2)
+            return (2, 1) if r < 0.6 else (1, 1)
+        if btype == "factory":
+            return (3, 2) if r < 0.7 else (2, 2)
+        if btype == "warehouse":
+            return (3, 2) if r < 0.55 else (2, 2)
+        return {
+            "school": (3, 2), "college": (3, 3), "police": (2, 1), "hospital": (2, 2),
+            "court": (2, 2), "prison": (3, 3), "station": (2, 1),
+        }.get(btype, (1, 1))
+
+    def _choose_building_type(self, tile: Tile) -> Optional[str]:
         district = self.districts[tile.district_id]
         zone = tile.zone
+        r = self.rng.random()
+        if tile.terrain == "park":
+            return "park_facility"
+        if zone == "green":
+            if self.rng.random() < 0.5:
+                tile.terrain = "park"
+                tile.movement_cost = min(tile.movement_cost, 1.25)
+            return None
         if zone == "commercial":
-            building_type = "shop" if district.wealth < 0.65 else "office"
-        elif zone == "industrial":
-            building_type = "factory" if self.rng.random() < 0.65 else "warehouse"
-        elif zone == "civic":
-            building_type = self.rng.choice(["school", "college", "police", "hospital", "station"])
-        elif zone == "mixed_use":
-            building_type = self.rng.choice(["apartment", "shop", "office"])
-        elif zone == "residential_high":
-            building_type = "apartment"
-        elif zone == "residential_mid":
-            building_type = self.rng.choice(["house", "apartment"])
-        else:
-            building_type = "house"
+            return "office" if r < 0.25 + district.wealth * 0.5 else "shop"
+        if zone == "industrial":
+            return "factory" if r < 0.6 else "warehouse"
+        if zone == "civic":
+            if r < 0.34:
+                return "school"
+            if r < 0.46:
+                return "college"
+            if r < 0.62:
+                return "police"
+            if r < 0.78:
+                return "hospital"
+            if r < 0.97:
+                return "station"
+            return "court" if r < 0.985 else "prison"
+        if zone == "mixed_use":
+            return self.rng.choice(["apartment", "shop", "office", "apartment"])
+        urban = tile.terrain == "urban"
+        if zone == "residential_high":
+            return "apartment" if (urban or r < 0.15) else "house"
+        if zone == "residential_mid":
+            return "apartment" if (urban and r < 0.55) else "house"
+        return "apartment" if (urban and r < 0.12) else "house"
+
+    def _spawn_building(self, door: Tile, tiles: List[Tuple[int, int]], building_type: str, facing: int) -> None:
+        district = self.districts[door.district_id]
+        xs = [t[0] for t in tiles]
+        ys = [t[1] for t in tiles]
+        area = len(tiles)
         quality = clamp(district.wealth + self.rng.uniform(-0.2, 0.2), 0.1, 1.0)
-        capacity = {
+        growth = area ** 0.8
+        capacity = int({
             "house": self.rng.randint(2, 6),
             "apartment": self.rng.randint(8, 32),
             "shop": self.rng.randint(4, 16),
@@ -629,7 +938,8 @@ class WorldMap:
             "park_facility": self.rng.randint(4, 10),
             "court": self.rng.randint(20, 50),
             "prison": self.rng.randint(40, 120),
-        }.get(building_type, self.rng.randint(5, 15))
+        }.get(building_type, self.rng.randint(5, 15)) * (growth if building_type not in ("house", "park_facility") else 1.0))
+        capacity = max(2, capacity)
         base_value = 400 + district.wealth * 2600 + quality * 1800
         if building_type in {"office", "hospital", "college"}:
             base_value *= 1.8
@@ -640,7 +950,7 @@ class WorldMap:
             name=f"{district.name} {building_type.title()} {self._building_counter}",
             building_type=building_type,
             district_id=district.district_id,
-            tile=(tile.x, tile.y),
+            tile=(door.x, door.y),
             capacity=capacity,
             quality=quality,
             rent=round(base_value * 0.28, 2) if building_type in {"house", "apartment"} else 0.0,
@@ -649,9 +959,15 @@ class WorldMap:
             job_slots=capacity if building_type not in {"house", "apartment"} else 0,
             level=self.rng.randint(1, 6) if building_type in {"apartment", "office"} else 1,
             open_hours=(6, 22) if building_type in {"shop", "hospital", "station"} else (8, 18),
+            anchor_x=min(xs),
+            anchor_y=min(ys),
+            width_tiles=max(xs) - min(xs) + 1,
+            height_tiles=max(ys) - min(ys) + 1,
+            facing=facing,
         )
         self.buildings[building.building_id] = building
-        tile.building_id = building.building_id
+        for tx, ty in tiles:
+            self.tiles[ty][tx].building_id = building.building_id
         district.building_ids.append(building.building_id)
         self._building_counter += 1
 
@@ -691,6 +1007,38 @@ class WorldMap:
             self.districts[company.district_id].company_ids.append(company.company_id)
             self._company_counter += 1
 
+    def _balance_housing(self) -> None:
+        """Thin out surplus residential lots so vacancy stays plausible (~25-35%)."""
+        target_jobs = sum(c.target_headcount for c in self.companies.values())
+        ceiling = max(300, int(self.width * self.height * 0.5 * min(1.0, self.density / 1.15)))
+        target_pop = min(int(target_jobs * 1.45), ceiling)
+        limit = int(target_pop * 1.35)
+        capacity = self.residential_population_capacity()
+        if capacity <= limit:
+            return
+        by_building: Dict[int, List[int]] = {}
+        for lid, listing in self.housing_market.items():
+            by_building.setdefault(listing.building_id, []).append(lid)
+        order = list(by_building)
+        self.rng.shuffle(order)
+        for bid in order:
+            if capacity <= limit:
+                break
+            building = self.buildings.get(bid)
+            if building is None:
+                continue
+            for lid in by_building[bid]:
+                listing = self.housing_market.pop(lid)
+                capacity -= self.PERSONS_PER_UNIT
+            for ty in range(building.anchor_y, building.anchor_y + building.height_tiles):
+                for tx in range(building.anchor_x, building.anchor_x + building.width_tiles):
+                    if 0 <= tx < self.width and 0 <= ty < self.height and self.tiles[ty][tx].building_id == bid:
+                        self.tiles[ty][tx].building_id = None
+            district = self.districts.get(building.district_id)
+            if district is not None and bid in district.building_ids:
+                district.building_ids.remove(bid)
+            del self.buildings[bid]
+
     def _generate_housing_market(self) -> None:
         for building in self.buildings.values():
             if building.building_type not in {"house", "apartment"}:
@@ -704,7 +1052,7 @@ class WorldMap:
                     rent=round(building.rent * self.rng.uniform(0.9, 1.15), 2),
                     purchase_price=round(building.purchase_price * self.rng.uniform(0.85, 1.25), 2),
                     quality=building.quality,
-                    bedrooms=max(1, min(4, building.capacity // 3)),
+                    bedrooms=(self.rng.choice([1, 1, 2, 2, 3]) if building.building_type == "apartment" else max(1, min(4, building.capacity // 3))),
                 )
                 self.housing_market[listing.listing_id] = listing
                 self._listing_counter += 1
@@ -742,48 +1090,135 @@ class WorldMap:
             target_posts = min(company.max_headcount, max(1, company.min_headcount // 3))
             for _ in range(target_posts):
                 title = self.rng.choice(titles_by_sector[company.sector])
-                posting = JobPosting(
-                    posting_id=self._posting_counter,
-                    company_id=company.company_id,
-                    district_id=company.district_id,
+                self.add_job_posting(
+                    company,
                     title=title,
-                    salary=round(self.rng.uniform(1800, 8500), 2),
                     required_skill=skill_by_sector[company.sector],
+                    salary=round(self.rng.uniform(1800, 8500), 2),
                     required_level=round(self.rng.uniform(0.1, 0.8), 2),
                     shift=self.rng.choice(company.shift_templates or [(9, 17)]),
                     urgency=self.rng.uniform(0.2, 1.0),
                 )
-                self.job_market[posting.posting_id] = posting
-                company.open_positions.append(title)
-                self._posting_counter += 1
+
+    def add_job_posting(
+        self,
+        company: Company,
+        title: str,
+        required_skill: str,
+        salary: Optional[float] = None,
+        required_level: Optional[float] = None,
+        shift: Optional[Tuple[int, int]] = None,
+        urgency: Optional[float] = None,
+    ) -> JobPosting:
+        posting = JobPosting(
+            posting_id=self._posting_counter,
+            company_id=company.company_id,
+            district_id=company.district_id,
+            title=title,
+            salary=round(self.rng.uniform(1800, 8500), 2) if salary is None else salary,
+            required_skill=required_skill,
+            required_level=round(self.rng.uniform(0.1, 0.8), 2) if required_level is None else required_level,
+            shift=tuple(shift) if shift is not None else (9, 17),
+            urgency=self.rng.uniform(0.2, 1.0) if urgency is None else urgency,
+        )
+        self.job_market[posting.posting_id] = posting
+        company.open_positions.append(title)
+        self._posting_counter += 1
+        return posting
 
     # ------------------------------------------------------------------
     # Economy and space updates
     # ------------------------------------------------------------------
-    def _recalculate_all_tile_values(self) -> None:
-        for y in range(self.height):
-            for x in range(self.width):
-                tile = self.tiles[y][x]
-                district = self.districts[tile.district_id]
-                transit = self._nearest_transit_bonus(x, y)
-                road_bonus = 0.2 if tile.road else 0.0
-                water_penalty = 0.3 if tile.terrain == "water" else 0.0
-                industrial_penalty = 0.18 if tile.terrain == "industrial" else 0.0
-                park_bonus = 0.15 if tile.terrain == "park" else 0.0
-                tile.property_value = max(
-                    50.0,
-                    500.0
-                    + district.wealth * 2500.0
-                    + transit * 900.0
-                    + road_bonus * 700.0
-                    + park_bonus * 500.0
-                    - district.crime_heat * 900.0
-                    - water_penalty * 200.0
-                    - industrial_penalty * 250.0,
-                )
-                tile.commute_factor = clamp(1.45 - transit - road_bonus, 0.35, 1.8)
+    def _static_tile_arrays(self) -> None:
+        """Cache per-tile static terrain arrays used by the vectorised value pass."""
+        H, W = self.height, self.width
+        road = np.zeros((H, W), dtype=np.float32)
+        water = np.zeros((H, W), dtype=np.float32)
+        industrial = np.zeros((H, W), dtype=np.float32)
+        park = np.zeros((H, W), dtype=np.float32)
+        dmap = np.zeros((H, W), dtype=np.int32)
+        for y, row in enumerate(self.tiles):
+            for x, tile in enumerate(row):
+                if tile.road:
+                    road[y, x] = 1.0
+                terrain = tile.terrain
+                if terrain == "water":
+                    water[y, x] = 1.0
+                elif terrain == "industrial":
+                    industrial[y, x] = 1.0
+                elif terrain == "park":
+                    park[y, x] = 1.0
+                dmap[y, x] = tile.district_id
+        transit = np.full((H, W), 9999.0, dtype=np.float32)
+        xs = np.arange(W, dtype=np.float32)[None, :]
+        ys = np.arange(H, dtype=np.float32)[:, None]
+        for line in self.transit_lines.values():
+            for sx, sy in line.stops:
+                transit = np.minimum(transit, np.abs(xs - sx) + np.abs(ys - sy))
+        reach = 18.0 * self.tile_scale
+        self._st_road = road
+        self._st_water = water
+        self._st_industrial = industrial
+        self._st_park = park
+        self._st_transit = np.clip(1.0 - transit / reach, 0.0, 1.0).astype(np.float32)
+        self._district_map = dmap
+        self._flat_tiles = [tile for row in self.tiles for tile in row]
 
-    def tick_daily_world(self, day_index: int) -> None:
+    def _recalculate_all_tile_values(self) -> None:
+        if getattr(self, "_st_road", None) is None or self._st_road.shape != (self.height, self.width):
+            self._static_tile_arrays()
+        max_id = max(self.districts) if self.districts else 0
+        wealth = np.zeros(max_id + 1, dtype=np.float32)
+        crime = np.zeros(max_id + 1, dtype=np.float32)
+        for did, district in self.districts.items():
+            wealth[did] = district.wealth
+            crime[did] = district.crime_heat
+        dmap = np.clip(self._district_map, 0, max_id)
+        w = wealth[dmap]
+        c = crime[dmap]
+        transit = self._st_transit
+        value = np.maximum(
+            50.0,
+            500.0
+            + w * 2500.0
+            + transit * 900.0
+            + self._st_road * (0.2 * 700.0)
+            + self._st_park * (0.15 * 500.0)
+            - c * 900.0
+            - self._st_water * (0.3 * 200.0)
+            - self._st_industrial * (0.18 * 250.0),
+        )
+        commute = np.clip(1.45 - transit - self._st_road * 0.2, 0.35, 1.8)
+        self.property_value_grid = value
+        self.crime_grid = c
+        for tile, pv, cf in zip(self._flat_tiles, value.ravel().tolist(), commute.ravel().tolist()):
+            tile.property_value = pv
+            tile.commute_factor = cf
+        self._refresh_ambient(value)
+
+    def _refresh_ambient(self, value: np.ndarray) -> None:
+        """Per-tile hourly mood deltas, read by Person in O(1) from flat lists."""
+        if getattr(self, "_st_crime_pressure", None) is None or self._st_crime_pressure.shape != (self.height, self.width):
+            cp = np.zeros((self.height, self.width), dtype=np.float32)
+            for y, row in enumerate(self.tiles):
+                for x, tile in enumerate(row):
+                    cp[y, x] = tile.crime_pressure
+            self._st_crime_pressure = cp
+        max_id = max(self.districts) if self.districts else 0
+        transit = np.zeros(max_id + 1, dtype=np.float32)
+        for did, district in self.districts.items():
+            transit[did] = district.transit_score
+        t = transit[np.clip(self._district_map, 0, max_id)]
+        stress = self._st_crime_pressure * 0.006 - t * 0.003
+        happy = (value / 4000.0) * 0.001
+        self._amb_stress = stress.ravel().tolist()
+        self._amb_happy = happy.ravel().tolist()
+
+    def ambient_at(self, x: int, y: int) -> Tuple[float, float]:
+        i = (y % self.height) * self.width + (x % self.width)
+        return self._amb_stress[i], self._amb_happy[i]
+
+    def tick_daily_world(self, day_index: int, population: Optional[Any] = None) -> None:
         for district in self.districts.values():
             wealth_shift = self.rng.uniform(-0.02, 0.02)
             crime_shift = self.rng.uniform(-0.015, 0.015)
@@ -800,7 +1235,10 @@ class WorldMap:
             company.supply = clamp(company.supply + self.rng.uniform(-0.06, 0.06), 0.0, 1.0)
             company.productivity = clamp(company.productivity + self.rng.uniform(-0.03, 0.03), 0.0, 1.0)
             company.bankruptcy_risk = clamp(
-                company.bankruptcy_risk + 0.08 * max(0.0, company.supply - company.demand) - company.productivity * 0.02,
+                company.bankruptcy_risk
+                + 0.04 * max(0.0, company.supply - company.demand)
+                - company.productivity * 0.02
+                - 0.004,
                 0.0,
                 1.0,
             )
@@ -815,11 +1253,10 @@ class WorldMap:
                 0.08,
             )
             company.market_value = max(25_000.0, company.market_value * (1.0 + valuation_shift))
-            if company.bankruptcy_risk > 0.78:
+            if company.bankruptcy_risk > 0.78 and company.cash < 0:
                 company.layoffs_pending = max(company.layoffs_pending, self.rng.randint(1, 5))
         self._recalculate_all_tile_values()
         self.refresh_markets()
-        self.record_economy_snapshot(day_index)
 
     def stabilize_economy_state(self) -> None:
         for company in self.companies.values():
@@ -876,42 +1313,89 @@ class WorldMap:
         return removed
 
     def refresh_markets(self) -> None:
+        expired = [
+            pid for pid, posting in self.job_market.items()
+            if posting.open_days >= 45
+        ]
+        for pid in expired:
+            posting = self.job_market.pop(pid)
+            company = self.companies.get(posting.company_id)
+            if company and posting.title in company.open_positions:
+                company.open_positions.remove(posting.title)
         for posting in self.job_market.values():
             posting.open_days += 1
             posting.urgency = clamp(posting.urgency + 0.02, 0.0, 1.0)
+        # Housing tracks inflation (daily) plus a desirability premium; the old
+        # curve was centred below 1.0 and deflated prices ~30% a year.
+        drift = self.inflation_rate / 365.0
         for listing in self.housing_market.values():
             district = self.districts[listing.district_id]
-            listing.rent = round(max(250.0, listing.rent * (0.99 + district.desirability * 0.03)), 2)
-            listing.purchase_price = round(max(40_000.0, listing.purchase_price * (0.985 + district.desirability * 0.04)), 2)
+            noise = self.rng.uniform(-0.0004, 0.0004)
+            rent_growth = clamp(1.0 + drift + (district.desirability - 0.5) * 0.0006 + noise, 0.997, 1.003)
+            price_growth = clamp(1.0 + drift * 1.2 + (district.desirability - 0.5) * 0.0010 + noise, 0.996, 1.004)
+            listing.rent = round(max(250.0, listing.rent * rent_growth), 2)
+            listing.purchase_price = round(max(40_000.0, listing.purchase_price * price_growth), 2)
 
-    def record_economy_snapshot(self, day_index: int) -> None:
+    def record_economy_snapshot(self, day_index: int, population: Optional[Any] = None) -> None:
         open_jobs = len([posting for posting in self.job_market.values() if posting.open_days < 45])
         housing_values = [listing.purchase_price for listing in self.housing_market.values()]
         rents = [listing.rent for listing in self.housing_market.values()]
         crime = [district.crime_heat for district in self.districts.values()]
         transit = [district.transit_score for district in self.districts.values()]
-        self.economic_history.append(
-            EconomySnapshot(
-                day_index=day_index,
-                unemployment_rate=clamp(0.18 - open_jobs / max(200.0, len(self.companies) * 3.0), 0.02, 0.35),
-                inflation=round(self.rng.uniform(0.01, 0.07), 3),
-                wage_index=round(sum(company.payroll_budget for company in self.companies.values()) / max(1, len(self.companies)), 2),
-                housing_index=round(sum(housing_values) / max(1, len(housing_values)), 2),
-                transit_index=round(sum(transit) / max(1, len(transit)), 2),
-                crime_index=round(sum(crime) / max(1, len(crime)), 2),
-            )
+        labor_force = employed = unemployed = 0
+        if population is not None:
+            labor_force, employed, unemployed = population.labor_stats()
+        unemployment_rate = unemployed / labor_force if labor_force else 0.0
+        snapshot = EconomySnapshot(
+            day_index=day_index,
+            unemployment_rate=round(unemployment_rate, 4),
+            inflation=round(self.rng.uniform(0.01, 0.07), 3),
+            wage_index=round(sum(company.payroll_budget for company in self.companies.values()) / max(1, len(self.companies)), 2),
+            housing_index=round(sum(housing_values) / max(1, len(housing_values)), 2),
+            transit_index=round(sum(transit) / max(1, len(transit)), 2),
+            crime_index=round(sum(crime) / max(1, len(crime)), 2),
+            labor_force=labor_force,
+            employed=employed,
+            unemployed=unemployed,
+            vacancies=open_jobs,
+            rent_index=round(sum(rents) / max(1, len(rents)), 2),
         )
-        if len(self.economic_history) > 365:
-            self.economic_history = self.economic_history[-365:]
+        if self.economic_history and self.economic_history[-1].day_index == day_index:
+            self.economic_history[-1] = snapshot
+        else:
+            self.economic_history.append(snapshot)
+        if len(self.economic_history) > 90:
+            self.economic_history = self.economic_history[-90:]
+
+    PERSONS_PER_UNIT = 1.9      # observed household size; units, not bedrooms, limit who can be housed
 
     def residential_population_capacity(self) -> int:
-        return int(sum(max(2, listing.bedrooms * 2 + 1) for listing in self.housing_market.values()))
+        return int(len(self.housing_market) * self.PERSONS_PER_UNIT)
 
     def recommended_population_size(self) -> int:
         target_jobs = sum(company.target_headcount for company in self.companies.values())
         housing_capacity = self.residential_population_capacity()
-        desired = int(target_jobs * 1.18)
-        return max(300, min(housing_capacity, desired, 300))
+        desired = int(target_jobs * 1.45)
+        # Keep tick cost predictable across seeds: ~0.5 citizens per tile at most.
+        ceiling = max(300, int(self.width * self.height * 0.5 * min(1.0, self.density / 1.15)))
+        return max(300, min(housing_capacity, desired, ceiling))
+
+    def calibrate_company_staffing(self, labor_force: int) -> None:
+        companies = list(self.companies.values())
+        current_target = sum(company.target_headcount for company in companies)
+        desired_target = int(labor_force * 0.92)
+        if current_target <= 0 or desired_target <= 0:
+            return
+        scale = min(1.0, desired_target / current_target)
+        for company in companies:
+            company.target_headcount = max(
+                company.min_headcount,
+                int(round(company.target_headcount * scale)),
+            )
+            company.max_headcount = max(
+                company.target_headcount + 2,
+                int(round(company.max_headcount * scale)),
+            )
 
     # ------------------------------------------------------------------
     # Spatial helpers
@@ -944,40 +1428,11 @@ class WorldMap:
             return cached
         return [tile for row in self.tiles for tile in row if tile.district_id == district_id]
 
-    def find_route(self, start: Tuple[int, int], goal: Tuple[int, int], max_steps: int = 500) -> List[Tuple[int, int]]:
-        if start == goal:
-            return [start]
-        cache_key = (start, goal, max_steps)
-        cached = self._route_cache.get(cache_key)
-        if cached is not None:
-            self._route_cache.move_to_end(cache_key)
-            return list(cached)
-        frontier = deque([start])
-        came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
-        steps = 0
-        while frontier and steps < max_steps:
-            current = frontier.popleft()
-            if current == goal:
-                break
-            for neighbor in self.neighbors(*current):
-                pos = (neighbor.x, neighbor.y)
-                if not neighbor.is_walkable() or pos in came_from:
-                    continue
-                frontier.append(pos)
-                came_from[pos] = current
-            steps += 1
-        if goal not in came_from:
-            return [start]
-        path: List[Tuple[int, int]] = []
-        node: Optional[Tuple[int, int]] = goal
-        while node is not None:
-            path.append(node)
-            node = came_from[node]
-        resolved = tuple(reversed(path))
-        self._route_cache[cache_key] = resolved
-        if len(self._route_cache) > ROUTE_CACHE_LIMIT:
-            self._route_cache.popitem(last=False)
-        return list(resolved)
+    def find_route(self, start: Tuple[int, int], goal: Tuple[int, int], max_steps: int = 2000) -> List[Tuple[int, int]]:
+        return self.route_service.find_route(tuple(start), tuple(goal), max_steps=max_steps)
+
+    def find_route_array(self, start: Tuple[int, int], goal: Tuple[int, int], max_steps: int = 2000, kind: int = 0) -> np.ndarray:
+        return self.route_service.find_route_array(tuple(start), tuple(goal), max_steps=max_steps, kind=kind)
 
     def commute_time(self, start: Tuple[int, int], goal: Tuple[int, int], vehicle_bonus: float = 1.0) -> float:
         path = self.find_route(start, goal, max_steps=1500)
@@ -992,13 +1447,16 @@ class WorldMap:
         return max(1.0, travel * 4.0 * rail_bonus / max(0.2, vehicle_bonus) + distance * 0.15)
 
     def estimate_commute_time(self, start: Tuple[int, int], goal: Tuple[int, int], vehicle_bonus: float = 1.0) -> float:
+        """Rough commute duration in minutes, using the same tile speeds as movement."""
         distance = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
         if distance <= 1:
             return 1.0
         start_tile = self.tile_at(*start)
         goal_tile = self.tile_at(*goal)
         transit_factor = 1.0 - min(0.35, (start_tile.transit_bonus() + goal_tile.transit_bonus()) * 0.35)
-        return max(1.0, distance * 2.6 * transit_factor / max(0.2, vehicle_bonus))
+        # vehicle_bonus 1.0 = on foot; larger values are faster modes.
+        tiles_per_hour = self.mode_tph[MODE_WALK] * max(0.2, vehicle_bonus) * transit_factor
+        return max(1.0, distance / tiles_per_hour * 60.0)
 
     def register_population_position(self, person_id: int, x: int, y: int) -> None:
         old = self.population_locations.get(person_id)
@@ -1029,6 +1487,16 @@ class WorldMap:
 
     def available_housing(self) -> List[HousingListing]:
         return [listing for listing in self.housing_market.values() if not listing.occupied]
+
+    def open_job_count(self) -> int:
+        companies = self.companies
+        buildings = self.buildings
+        count = 0
+        for posting in self.job_market.values():
+            company = companies.get(posting.company_id)
+            if company is not None and company.building_id in buildings:
+                count += 1
+        return count
 
     def open_job_postings(self) -> List[JobPosting]:
         valid_postings = []
@@ -1072,7 +1540,7 @@ class WorldMap:
 
     def _serialize_economic_history(self) -> List[Dict[str, Any]]:
         history: List[Dict[str, Any]] = []
-        for snapshot in self.economic_history[-180:]:
+        for snapshot in self.economic_history[-90:]:
             history.append(
                 {
                     "day_index": snapshot.day_index,
@@ -1082,6 +1550,11 @@ class WorldMap:
                     "housing_index": round_for_save(snapshot.housing_index, 2),
                     "transit_index": round_for_save(snapshot.transit_index),
                     "crime_index": round_for_save(snapshot.crime_index),
+                    "labor_force": snapshot.labor_force,
+                    "employed": snapshot.employed,
+                    "unemployed": snapshot.unemployed,
+                    "vacancies": snapshot.vacancies,
+                    "rent_index": round_for_save(snapshot.rent_index, 2),
                 }
             )
         return history
@@ -1184,7 +1657,6 @@ class WorldMap:
                         transit_stop=bool(tile_flags & TILE_FLAG_TRANSIT_STOP),
                         landmark=landmarks.get(idx),
                         building_id=building_ids.get(idx),
-                        residents=[],
                         occupants=[],
                     )
                 )
@@ -1196,11 +1668,11 @@ class WorldMap:
     # ------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "seed": self.seed,
             "width": self.width,
             "height": self.height,
-            "tiles": [[tile.__dict__.copy() for tile in row] for row in self.tiles],
+            "density": self.density,
             "tiles_compact": self._serialize_tiles_compact(),
             "districts": {k: v.__dict__ for k, v in self.districts.items()},
             "buildings": {k: v.__dict__ for k, v in self.buildings.items()},
@@ -1210,6 +1682,7 @@ class WorldMap:
             "job_market": {k: v.__dict__ for k, v in self.job_market.items()},
             "economic_history": self._serialize_economic_history(),
             "landmarks": self.landmarks,
+            "rng_state": self.rng.getstate(),
             "counters": {
                 "building": self._building_counter,
                 "company": self._company_counter,
@@ -1221,28 +1694,74 @@ class WorldMap:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WorldMap":
-        world = cls(seed=data["seed"], width=data["width"], height=data["height"])
-        if "tiles" in data:
-            world.tiles = [[Tile(**tile_data) for tile_data in row] for row in data["tiles"]]
-        elif "tiles_compact" in data:
+        world = cls._empty(seed=data["seed"], width=data["width"], height=data["height"], density=data.get("density"))
+        if "tiles_compact" in data:
             world.tiles = cls._deserialize_tiles_compact(data["width"], data["height"], data["tiles_compact"])
         else:
             world.tiles = [[Tile(**tile_data) for tile_data in row] for row in data["tiles"]]
-        world.districts = {int(k): District(**v) for k, v in data["districts"].items()}
-        world.buildings = {int(k): Building(**v) for k, v in data["buildings"].items()}
-        world.companies = {int(k): Company(**v) for k, v in data["companies"].items()}
-        world.transit_lines = {int(k): TransitLine(**v) for k, v in data["transit_lines"].items()}
+        world.districts = {
+            int(k): District(
+                **{
+                    **v,
+                    "center": tuple(v["center"]),
+                }
+            )
+            for k, v in data["districts"].items()
+        }
+        world.buildings = {
+            int(k): Building(
+                **{
+                    **v,
+                    "tile": tuple(v["tile"]),
+                    "open_hours": tuple(v.get("open_hours", (8, 18))),
+                }
+            )
+            for k, v in data["buildings"].items()
+        }
+        world.companies = {
+            int(k): Company(
+                **{
+                    **v,
+                    "shift_templates": [tuple(shift) for shift in v.get("shift_templates", [])],
+                }
+            )
+            for k, v in data["companies"].items()
+        }
+        world.transit_lines = {
+            int(k): TransitLine(
+                **{
+                    **v,
+                    "stops": [tuple(stop) for stop in v.get("stops", [])],
+                }
+            )
+            for k, v in data["transit_lines"].items()
+        }
         world.housing_market = {int(k): HousingListing(**v) for k, v in data["housing_market"].items()}
-        world.job_market = {int(k): JobPosting(**v) for k, v in data["job_market"].items()}
+        world.job_market = {
+            int(k): JobPosting(
+                **{
+                    **v,
+                    "shift": tuple(v.get("shift", (9, 17))),
+                }
+            )
+            for k, v in data["job_market"].items()
+        }
         world.economic_history = [EconomySnapshot(**snap) for snap in data["economic_history"]]
-        world.landmarks = [tuple(item) for item in data["landmarks"]]
-        world.population_locations = {int(k): tuple(v) for k, v in data.get("population_locations", {}).items()}
-        world._building_counter = data["counters"]["building"]
-        world._company_counter = data["counters"]["company"]
-        world._listing_counter = data["counters"]["listing"]
-        world._posting_counter = data["counters"]["posting"]
-        world._line_counter = data["counters"]["line"]
+        world.landmarks = [(str(name), tuple(tile)) for name, tile in data["landmarks"]]
+        counters = data.get("counters", {})
+        world._building_counter = counters.get("building", max(world.buildings, default=0) + 1)
+        world._company_counter = counters.get("company", max(world.companies, default=0) + 1)
+        world._listing_counter = counters.get("listing", max(world.housing_market, default=0) + 1)
+        world._posting_counter = counters.get("posting", max(world.job_market, default=0) + 1)
+        world._line_counter = counters.get("line", max(world.transit_lines, default=0) + 1)
+        rng_state = coerce_rng_state(data.get("rng_state"))
+        if rng_state is not None:
+            world.rng.setstate(rng_state)
+        world.ensure_unique_symbols()
+        world._compute_signals()
         world._rebuild_spatial_indexes()
+        world._recalculate_all_tile_values()
+        world._build_routing_arrays()
         return world
 
     # ------------------------------------------------------------------
@@ -1271,10 +1790,6 @@ class WorldMap:
             best = min(best, line.nearest_stop_distance(x, y))
         return clamp(1.0 - best / 18.0, 0.0, 1.0)
 
-    def _company_prefix(self) -> str:
-        prefixes = ["Atlas", "Union", "Metro", "Summit", "Harbor", "Silver", "Civic", "Granite", "Signal", "Pioneer"]
-        return self.rng.choice(prefixes)
-
     def _company_name(self, sector: str, company_scale: str) -> str:
         if company_scale == "indie":
             founders = ["Elm", "Northlane", "Copper", "Juniper", "Bluebird", "Foxglove", "Lantern", "Brickhouse"]
@@ -1288,76 +1803,88 @@ class WorldMap:
         standard_suffix = ["Group", "Partners", "Services", "Network", "Exchange", "Enterprises"]
         return f"{self.rng.choice(standard_prefix)} {sector.title()} {self.rng.choice(standard_suffix)}"
 
-    def _company_label(self, company_scale: str) -> str:
-        labels = {
-            "indie": "Collective",
-            "standard": "Group",
-            "industrial": "Works",
-        }
-        return labels.get(company_scale, "Group")
-
     def _company_spawn_chance(self, building: Building) -> float:
         chances = {
-            "shop": 0.08,
-            "office": 0.1,
-            "factory": 0.38,
-            "warehouse": 0.3,
-            "hospital": 0.15,
+            "shop": 0.14,
+            "office": 0.16,
+            "factory": 0.48,
+            "warehouse": 0.38,
+            "hospital": 0.24,
         }
         return chances.get(building.building_type, 0.2)
 
     def _company_scale_profile(self, building: Building) -> Tuple[str, int, int, int]:
         if building.building_type in {"factory", "warehouse"}:
-            if self.rng.random() < 0.58:
-                min_headcount = self.rng.randint(110, 140)
-                target_headcount = self.rng.randint(max(120, min_headcount), 185)
-                max_headcount = self.rng.randint(target_headcount + 20, target_headcount + 70)
+            if self.rng.random() < 0.35:
+                min_headcount = self.rng.randint(50, 85)
+                target_headcount = self.rng.randint(max(60, min_headcount), 125)
+                max_headcount = self.rng.randint(target_headcount + 12, target_headcount + 40)
                 building.job_slots = max(building.job_slots, max_headcount)
                 building.capacity = max(building.capacity, min_headcount // 2)
                 return ("industrial", min_headcount, target_headcount, max_headcount)
-            target_headcount = self.rng.randint(100, 130)
-            max_headcount = self.rng.randint(target_headcount + 10, target_headcount + 40)
+            target_headcount = self.rng.randint(40, 85)
+            max_headcount = self.rng.randint(target_headcount + 8, target_headcount + 30)
             building.job_slots = max(building.job_slots, max_headcount)
             building.capacity = max(building.capacity, target_headcount // 3)
-            return ("standard", 100, target_headcount, max_headcount)
+            return ("standard", 30, target_headcount, max_headcount)
         if building.building_type == "shop":
-            if self.rng.random() < 0.32:
-                target_headcount = self.rng.randint(8, 20)
-                max_headcount = self.rng.randint(target_headcount + 2, target_headcount + 10)
+            if self.rng.random() < 0.55:
+                target_headcount = self.rng.randint(5, 18)
+                max_headcount = self.rng.randint(target_headcount + 2, target_headcount + 8)
                 building.job_slots = max(building.job_slots, max_headcount)
-                return ("indie", 4, target_headcount, max_headcount)
-            target_headcount = self.rng.randint(100, 115)
-            max_headcount = self.rng.randint(target_headcount + 8, target_headcount + 25)
+                return ("indie", 3, target_headcount, max_headcount)
+            target_headcount = self.rng.randint(24, 55)
+            max_headcount = self.rng.randint(target_headcount + 6, target_headcount + 18)
             building.job_slots = max(building.job_slots, max_headcount)
-            return ("standard", 100, target_headcount, max_headcount)
+            return ("standard", 16, target_headcount, max_headcount)
         if building.building_type == "office":
-            if self.rng.random() < 0.18:
-                target_headcount = self.rng.randint(10, 24)
+            if self.rng.random() < 0.25:
+                target_headcount = self.rng.randint(10, 28)
                 max_headcount = self.rng.randint(target_headcount + 4, target_headcount + 12)
                 building.job_slots = max(building.job_slots, max_headcount)
-                return ("indie", 6, target_headcount, max_headcount)
-            if self.rng.random() < 0.3:
-                target_headcount = self.rng.randint(125, 180)
-                max_headcount = self.rng.randint(target_headcount + 18, target_headcount + 60)
+                return ("indie", 5, target_headcount, max_headcount)
+            if self.rng.random() < 0.15:
+                target_headcount = self.rng.randint(70, 120)
+                max_headcount = self.rng.randint(target_headcount + 12, target_headcount + 35)
                 building.job_slots = max(building.job_slots, max_headcount)
-                return ("industrial", 110, target_headcount, max_headcount)
-            target_headcount = self.rng.randint(100, 130)
-            max_headcount = self.rng.randint(target_headcount + 10, target_headcount + 35)
+                return ("industrial", 50, target_headcount, max_headcount)
+            target_headcount = self.rng.randint(35, 85)
+            max_headcount = self.rng.randint(target_headcount + 8, target_headcount + 25)
             building.job_slots = max(building.job_slots, max_headcount)
-            return ("standard", 100, target_headcount, max_headcount)
+            return ("standard", 22, target_headcount, max_headcount)
         if building.building_type == "hospital":
-            target_headcount = self.rng.randint(100, 130)
-            max_headcount = self.rng.randint(target_headcount + 10, target_headcount + 35)
+            target_headcount = self.rng.randint(45, 95)
+            max_headcount = self.rng.randint(target_headcount + 8, target_headcount + 28)
             building.job_slots = max(building.job_slots, max_headcount)
-            return ("standard", 100, target_headcount, max_headcount)
-        target_headcount = self.rng.randint(100, 125)
-        max_headcount = self.rng.randint(target_headcount + 8, target_headcount + 30)
+            return ("standard", 30, target_headcount, max_headcount)
+        target_headcount = self.rng.randint(20, 60)
+        max_headcount = self.rng.randint(target_headcount + 6, target_headcount + 20)
         building.job_slots = max(building.job_slots, max_headcount)
-        return ("standard", 100, target_headcount, max_headcount)
+        return ("standard", 12, target_headcount, max_headcount)
 
     def _make_stock_symbol(self, sector: str) -> str:
-        parts = sector[:2].upper() + "".join(self.rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(2))
-        return parts[:4]
+        """A ticker no other company has used (delisted symbols stay reserved)."""
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for attempt in range(400):
+            tail = 2 if attempt < 200 else 3      # widen the namespace if a sector's 2-letter space fills up
+            symbol = (sector[:2].upper() + "".join(self.rng.choice(letters) for _ in range(tail)))[:4 if tail == 2 else 5]
+            if symbol not in self._used_symbols:
+                self._used_symbols.add(symbol)
+                return symbol
+        raise RuntimeError("could not allocate a unique stock symbol")
+
+    def ensure_unique_symbols(self) -> int:
+        """Repair duplicate tickers (e.g. from older saves); returns how many were renamed."""
+        seen: set = set()
+        renamed = 0
+        self._used_symbols = {c.stock_symbol for c in self.companies.values()}
+        for company in sorted(self.companies.values(), key=lambda c: c.company_id):
+            if company.stock_symbol in seen or not company.stock_symbol:
+                company.stock_symbol = self._make_stock_symbol(company.sector)
+                renamed += 1
+            seen.add(company.stock_symbol)
+        self._used_symbols |= seen
+        return renamed
 
     def _sector_for_building(self, building_type: str) -> str:
         mapping = {

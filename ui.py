@@ -13,7 +13,7 @@ from __future__ import annotations
 import curses
 import textwrap
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from entities import Person
 from engine import SimulationEngine
@@ -289,9 +289,9 @@ class TerminalUI:
     # Right column
     # ------------------------------------------------------------------
     def _draw_right_column(self, y: int, x: int, height: int, width: int) -> None:
-        h1 = max(8, height // 4)
-        h2 = max(8, height // 4)
-        h3 = max(8, height // 4)
+        h1 = max(15, height // 3)
+        h2 = max(8, height // 5)
+        h3 = max(7, height // 6)
         h4 = max(6, height - h1 - h2 - h3)
         self._draw_metrics_panel(y, x, h1, width)
         self._draw_news_panel(y + h1, x, h2, width)
@@ -306,6 +306,11 @@ class TerminalUI:
             f"Weather        {self.engine.weather.condition}",
             f"Housing idx    {metrics['housing_index']:0.0f}",
             f"Crime idx      {metrics['crime_index']:0.2f}",
+            f"Labor force    {metrics['labor_force']:0.0f}",
+            f"Employed       {metrics['employed']:0.0f}",
+            f"Unemployed     {metrics['unemployed']:0.0f} ({metrics['unemployment']:0.1%})",
+            f"Vacancies      {metrics['vacancies']:0.0f}",
+            f"Births/Deaths  {metrics['births']:0.0f}/{metrics['deaths']:0.0f}",
             f"Avg happiness  {metrics['avg_happiness']:0.2f}",
             f"Avg stress     {metrics['avg_stress']:0.2f}",
             f"Avg karma      {metrics['avg_karma']:0.2f}",
@@ -547,22 +552,3 @@ class TerminalUI:
         ]
         return [line[:width] for line in lines]
 
-    # The following method intentionally centralizes optional dashboard
-    # content for future alternate layouts. Keeping this in the UI layer
-    # avoids hard-coding a single presentation and makes it easier to
-    # expose new systemic information without modifying the engine core.
-    def alternate_dashboard_sections(self, width: int) -> List[Tuple[str, List[str]]]:
-        return [
-            ("Economy", self.economy_chart_lines(width)),
-            ("Districts", self.district_lines(width)),
-            ("Companies", self.company_lines(width)),
-            ("Schedule", self.player_schedule_lines(width)),
-            ("Memories", self.player_memory_lines(width)),
-            ("Hotspots", self.world_hotspot_lines(width)),
-            ("Transit", self.transport_lines(width)),
-            ("Weather", self.weather_lines(width)),
-            ("Stocks", self.stock_lines(width)),
-            ("Law", self.legal_lines(width)),
-            ("Education", self.education_lines(width)),
-            ("Help", self.control_help_lines(width)),
-        ]

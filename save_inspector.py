@@ -6,11 +6,13 @@ import pickle
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
+
+from world import clamp
 
 try:
     import importlib.util
@@ -42,10 +44,6 @@ GOOD = (91, 214, 138)
 WARN = (240, 199, 92)
 BAD = (236, 103, 103)
 SHADOW = (7, 10, 15)
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
 
 
 def format_money(value: Any) -> str:
@@ -160,7 +158,7 @@ def decode_save_blob(blob: bytes) -> Dict[str, Any]:
         if codec == "msgpack":
             if not MSGPACK_AVAILABLE:
                 raise RuntimeError("Save uses msgpack but msgpack is not installed.")
-            return msgpack.unpackb(payload, raw=False)
+            return msgpack.unpackb(payload, raw=False, strict_map_key=False)
         return pickle.loads(payload)
     return pickle.loads(blob)
 
