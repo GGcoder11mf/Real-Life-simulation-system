@@ -5,6 +5,7 @@ import os
 import pickle
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -140,7 +141,21 @@ def memory_field(memory: Any, field: str) -> Any:
     return None
 
 
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes} B"
+
+
 def read_save_blob(path: Path) -> bytes:
+    if not path.exists():
+        raise FileNotFoundError(f"Save file not found: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError("Empty save file (0 bytes).")
     with path.open("rb") as probe:
         prefix = probe.read(2)
     if prefix == b"\x1f\x8b":
@@ -241,6 +256,8 @@ class SavePreview:
     status: str
     summary: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    size_bytes: int = 0
+    modified: str = ""
 
 
 class SaveIndex:
@@ -781,15 +798,18 @@ class SaveIndex:
 class SaveInspectorApp:
     def __init__(self, root: Path) -> None:
         pygame.init()
+        pygame.key.set_repeat(350, 32)
         pygame.display.set_caption("RLS Save Inspector")
         self.screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
         self.root = root
         self.fonts = {
-            "small": pygame.font.SysFont("segoeui,arial", 16),
-            "body": pygame.font.SysFont("segoeui,arial", 20),
-            "title": pygame.font.SysFont("segoeui,arial", 28, bold=True),
-            "hero": pygame.font.SysFont("segoeui,arial", 38, bold=True),
+            "tiny": pygame.font.SysFont("segoeui,arial", 13),
+            "small": pygame.font.SysFont("segoeui,arial", 15),
+            "body": pygame.font.SysFont("segoeui,arial", 17),
+            "section": pygame.font.SysFont("segoeui,arial", 20, bold=True),
+            "title": pygame.font.SysFont("segoeui,arial", 24, bold=True),
+            "hero": pygame.font.SysFont("segoeui,arial", 30, bold=True),
         }
         self.running = True
         self.mode = "loader"
@@ -797,7 +817,6 @@ class SaveInspectorApp:
         self.loader_selection = 0
         self.loader_scroll = 0
         self.loader_message = "Scanning for save files..."
-        self.loader_busy = False
         self.loader_query = ""
         self.loader_input_active = False
         self.index: Optional[SaveIndex] = None
@@ -807,35 +826,66 @@ class SaveInspectorApp:
         self.sort_key = "name"
         self.result_selection = 0
         self.result_scroll = 0
-        self.status_message = "L load another save | / focus search | Tab categories | F2 sort"
+        self.detail_scroll = 0
+        self._detail_max_scroll = 0
+        self._detail_viewport = pygame.Rect(0, 0, 1, 1)
+        self._list_viewport = pygame.Rect(0, 0, 1, 1)
+        self._loader_viewport = pygame.Rect(0, 0, 1, 1)
+        self.status_message = "Type to search | Up/Down select | Tab category | F2 sort | Ctrl+L switch save"
         self._click_regions: List[Tuple[pygame.Rect, str, Any]] = []
+        self._hover_regions: List[Tuple[pygame.Rect, str, Any]] = []
+        self._grad_cache: Dict[Tuple[int, int, Tuple[int, int, int], Tuple[int, int, int]], pygame.Surface] = {}
+        self._filter_cache_key: Optional[Tuple[int, str, str, str]] = None
+        self._filter_cache: List[EntityRecord] = []
+        self._last_click_time = 0
+        self._last_click_item: Any = None
         self.refresh_loader()
 
     def refresh_loader(self) -> None:
-        self.loader_busy = True
-        self.loader_message = "Scanning save files..."
         self.loader_items = self.scan_save_files()
         self.loader_selection = 0
         self.loader_scroll = 0
-        self.loader_busy = False
         if not self.loader_items:
             self.loader_message = "No .pkl/.save files found. Type a path below or copy one into this folder."
         else:
-            self.loader_message = f"Found {len(self.loader_items)} save files."
+            ok_count = sum(1 for item in self.loader_items if item.status == "ok")
+            self.loader_message = f"Found {len(self.loader_items)} file(s) ({ok_count} readable)."
 
     def scan_save_files(self) -> List[SavePreview]:
         candidates: List[Path] = []
-        for path in self.root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in SAVE_EXTENSIONS:
-                candidates.append(path)
+        skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules"}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for name in filenames:
+                path = Path(dirpath) / name
+                if path.suffix.lower() in SAVE_EXTENSIONS:
+                    candidates.append(path)
         candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         previews: List[SavePreview] = []
         for path in candidates[:80]:
+            stat = path.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
             try:
                 summary = build_save_summary(load_save_data(path))
-                previews.append(SavePreview(path=path, status="ok", summary=summary))
+                previews.append(
+                    SavePreview(
+                        path=path,
+                        status="ok",
+                        summary=summary,
+                        size_bytes=stat.st_size,
+                        modified=modified,
+                    )
+                )
             except Exception as exc:
-                previews.append(SavePreview(path=path, status="error", error=str(exc)))
+                previews.append(
+                    SavePreview(
+                        path=path,
+                        status="error",
+                        error=str(exc),
+                        size_bytes=stat.st_size,
+                        modified=modified,
+                    )
+                )
         return previews
 
     def run(self) -> None:
@@ -860,15 +910,25 @@ class SaveInspectorApp:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             self.handle_mouse(event.pos, event.button)
         elif event.type == pygame.MOUSEWHEEL:
-            if self.mode == "loader":
-                self.loader_scroll = max(0, self.loader_scroll - event.y)
+            self.handle_wheel(pygame.mouse.get_pos(), event.y)
+
+    def handle_wheel(self, pos: Tuple[int, int], delta_y: int) -> None:
+        if delta_y == 0:
+            return
+        if self.mode == "loader":
+            self.loader_scroll = max(0, self.loader_scroll - delta_y * 2)
+        else:
+            if self._detail_viewport.collidepoint(pos):
+                self.detail_scroll = int(clamp(self.detail_scroll - delta_y * 44, 0, self._detail_max_scroll))
             else:
-                self.result_scroll = max(0, self.result_scroll - event.y)
+                self.result_scroll = max(0, self.result_scroll - delta_y * 3)
 
     def handle_loader_key(self, event: pygame.event.Event) -> None:
         if self.loader_input_active:
             if event.key == pygame.K_RETURN:
-                self.load_path(Path(self.loader_query.strip()))
+                raw = self.loader_query.strip().strip('"').strip("'")
+                if raw:
+                    self.load_path(Path(raw))
                 self.loader_input_active = False
             elif event.key == pygame.K_ESCAPE:
                 self.loader_input_active = False
@@ -889,18 +949,28 @@ class SaveInspectorApp:
         elif event.key == pygame.K_SLASH:
             self.loader_input_active = True
         elif event.key == pygame.K_ESCAPE:
-            self.running = False
+            if self.index is not None:
+                self.mode = "browser"
+            else:
+                self.running = False
 
     def handle_browser_key(self, event: pygame.event.Event) -> None:
-        if event.key == pygame.K_ESCAPE and self.search_text:
-            self.search_text = ""
-            self.result_selection = 0
-            self.result_scroll = 0
-            return
-        if event.key == pygame.K_l:
+        ctrl = bool(event.mod & pygame.KMOD_CTRL)
+        shift = bool(event.mod & pygame.KMOD_SHIFT)
+        if ctrl and event.key == pygame.K_l:
             self.mode = "loader"
             self.loader_input_active = False
             self.status_message = "Pick another save."
+            return
+        if event.key == pygame.K_ESCAPE:
+            if self.search_text:
+                self.search_text = ""
+                self.result_selection = 0
+                self.result_scroll = 0
+                self.detail_scroll = 0
+            else:
+                self.mode = "loader"
+                self.loader_input_active = False
             return
         if event.key == pygame.K_F2:
             options = self.current_sort_options()
@@ -911,43 +981,80 @@ class SaveInspectorApp:
                 self.sort_key = keys[(keys.index(self.sort_key) + 1) % len(keys)]
             self.result_selection = 0
             self.result_scroll = 0
+            self.detail_scroll = 0
             return
         if event.key == pygame.K_TAB:
-            index = (self.category_tabs.index(self.selected_category) + 1) % len(self.category_tabs)
+            step = -1 if shift else 1
+            index = (self.category_tabs.index(self.selected_category) + step) % len(self.category_tabs)
             self.select_category(self.category_tabs[index])
             return
-        if event.key in (pygame.K_DOWN, pygame.K_j):
-            self.result_selection = min(max(0, len(self.filtered_records()) - 1), self.result_selection + 1)
-        elif event.key in (pygame.K_UP, pygame.K_k):
-            self.result_selection = max(0, self.result_selection - 1)
-        elif event.key == pygame.K_PAGEUP:
+        if event.key == pygame.K_DOWN:
+            count = len(self.filtered_records())
+            if count:
+                self.result_selection = min(count - 1, self.result_selection + 1)
+                self.detail_scroll = 0
+                self._ensure_result_visible()
+            return
+        if event.key == pygame.K_UP:
+            if self.result_selection > 0:
+                self.result_selection -= 1
+                self.detail_scroll = 0
+                self._ensure_result_visible()
+            return
+        if event.key == pygame.K_PAGEUP:
             self.result_selection = max(0, self.result_selection - 10)
-        elif event.key == pygame.K_PAGEDOWN:
-            self.result_selection = min(max(0, len(self.filtered_records()) - 1), self.result_selection + 10)
-        elif event.key == pygame.K_BACKSPACE:
-            self.search_text = self.search_text[:-1]
-            self.result_selection = 0
-            self.result_scroll = 0
-        else:
-            if event.unicode and event.unicode.isprintable():
-                self.search_text += event.unicode
+            self.detail_scroll = 0
+            self._ensure_result_visible()
+            return
+        if event.key == pygame.K_PAGEDOWN:
+            count = len(self.filtered_records())
+            if count:
+                self.result_selection = min(count - 1, self.result_selection + 10)
+                self.detail_scroll = 0
+                self._ensure_result_visible()
+            return
+        if event.key == pygame.K_BACKSPACE:
+            if self.search_text:
+                self.search_text = self.search_text[:-1]
                 self.result_selection = 0
                 self.result_scroll = 0
+                self.detail_scroll = 0
+            return
+        if not ctrl and event.unicode and event.unicode.isprintable():
+            self.search_text += event.unicode
+            self.result_selection = 0
+            self.result_scroll = 0
+            self.detail_scroll = 0
+
+    def _ensure_result_visible(self) -> None:
+        visible = max(1, self._list_viewport.h // 84)
+        if self.result_selection < self.result_scroll:
+            self.result_scroll = self.result_selection
+        elif self.result_selection >= self.result_scroll + visible:
+            self.result_scroll = self.result_selection - visible + 1
 
     def handle_mouse(self, pos: Tuple[int, int], button: int) -> None:
-        if button not in (1, 4, 5):
-            return
         if button in (4, 5):
-            delta = -1 if button == 4 else 1
-            if self.mode == "loader":
-                self.loader_scroll = max(0, self.loader_scroll + delta)
-            else:
-                self.result_scroll = max(0, self.result_scroll + delta)
+            self.handle_wheel(pos, 1 if button == 4 else -1)
             return
-        for rect, action, payload in self._click_regions:
+        if button != 1:
+            return
+        now = pygame.time.get_ticks()
+        for rect, action, payload in reversed(self._click_regions):
             if rect.collidepoint(pos):
-                if action == "load_preview":
-                    self.load_preview(payload)
+                if action == "select_preview":
+                    is_double = (self._last_click_item == payload and now - self._last_click_time < 380)
+                    self.loader_selection = payload
+                    self.loader_input_active = False
+                    self._last_click_item = payload
+                    self._last_click_time = now
+                    if is_double and 0 <= payload < len(self.loader_items):
+                        self.load_preview(self.loader_items[payload])
+                elif action == "open_selected_preview":
+                    if 0 <= self.loader_selection < len(self.loader_items):
+                        self.load_preview(self.loader_items[self.loader_selection])
+                elif action == "refresh_loader":
+                    self.refresh_loader()
                 elif action == "loader_input":
                     self.loader_input_active = True
                 elif action == "select_category":
@@ -956,41 +1063,64 @@ class SaveInspectorApp:
                     self.sort_key = payload
                     self.result_selection = 0
                     self.result_scroll = 0
+                    self.detail_scroll = 0
                 elif action == "select_result":
                     self.result_selection = payload
+                    self.detail_scroll = 0
+                elif action == "clear_search":
+                    self.search_text = ""
+                    self.result_selection = 0
+                    self.result_scroll = 0
+                    self.detail_scroll = 0
                 elif action == "open_loader":
                     self.mode = "loader"
-                break
+                    self.loader_input_active = False
+                return
+        if self.mode == "loader":
+            self.loader_input_active = False
 
     def load_preview(self, preview: SavePreview) -> None:
         if preview.status != "ok":
-            self.status_message = preview.error or "This file could not be loaded."
+            self.loader_message = preview.error or "This file could not be loaded."
             return
         self.load_path(preview.path)
 
     def load_path(self, path: Path) -> None:
         try:
-            data = load_save_data(path)
-            self.index = SaveIndex(path, data)
+            resolved = path if path.is_absolute() else (self.root / path)
+            data = load_save_data(resolved)
+            self.index = SaveIndex(resolved, data)
+            self._filter_cache_key = None
+            self._filter_cache = []
             self.mode = "browser"
             self.selected_category = "all"
             self.sort_key = "name"
             self.result_selection = 0
             self.result_scroll = 0
+            self.detail_scroll = 0
             self.search_text = ""
-            self.status_message = f"Loaded {path.name}. Search by name, sector, job, district, symbol, headline, or id."
+            self.status_message = f"Loaded {resolved.name} ({len(self.index.records):,} records). Type to filter, Tab for categories, F2 to sort."
         except Exception as exc:
+            self.loader_message = f"Load failed: {exc}"
             self.status_message = f"Load failed: {exc}"
 
     def filtered_records(self) -> List[EntityRecord]:
         if not self.index:
             return []
+        key = (id(self.index), self.selected_category, self.search_text, self.sort_key)
+        if self._filter_cache_key == key:
+            return self._filter_cache
         records = list(self.index.records_for(self.selected_category))
         if self.search_text.strip():
             tokens = [token.lower() for token in self.search_text.split() if token.strip()]
-            records = [record for record in records if all(token in record.search_text or token in record.record_id.lower() for token in tokens)]
+            records = [
+                record for record in records
+                if all(token in record.search_text or token in record.record_id.lower() for token in tokens)
+            ]
         reverse = self.sort_key not in {"name", "id", "category"}
         records.sort(key=lambda record: record.sort_values.get(self.sort_key, record.sort_values.get("name")), reverse=reverse)
+        self._filter_cache_key = key
+        self._filter_cache = records
         return records
 
     def current_sort_options(self) -> List[Tuple[str, str]]:
@@ -1005,17 +1135,19 @@ class SaveInspectorApp:
             self.sort_key = options[0]
         self.result_selection = 0
         self.result_scroll = 0
+        self.detail_scroll = 0
 
     def selected_record(self) -> Optional[EntityRecord]:
         records = self.filtered_records()
         if not records:
             return None
-        self.result_selection = clamp(self.result_selection, 0, len(records) - 1)
-        return records[int(self.result_selection)]
+        self.result_selection = int(clamp(self.result_selection, 0, len(records) - 1))
+        return records[self.result_selection]
 
     def draw(self) -> None:
         self.screen.fill(UI_BG)
         self._click_regions = []
+        self._hover_regions = []
         if self.mode == "loader":
             self.draw_loader()
         else:
@@ -1023,29 +1155,41 @@ class SaveInspectorApp:
 
     def draw_loader(self) -> None:
         width, height = self.screen.get_size()
-        self.draw_gradient((0, 0, width, height), (11, 19, 30), (24, 38, 54))
-        outer = pygame.Rect(36, 36, width - 72, height - 72)
-        self.draw_panel(outer, radius=24)
-        self.draw_text("RLS Save Inspector", self.fonts["hero"], TEXT, (outer.x + 28, outer.y + 24))
-        self.draw_text("Choose a save file or type a path. Loader previews counts and world state before opening.", self.fonts["body"], TEXT_MUTED, (outer.x + 30, outer.y + 74))
+        mouse_pos = pygame.mouse.get_pos()
+        self.draw_gradient((0, 0, width, height), (11, 18, 28), (22, 34, 49))
+        outer = pygame.Rect(28, 24, width - 56, height - 48)
+        self.draw_panel(outer, fill=PANEL_BG, radius=20)
 
-        left = pygame.Rect(outer.x + 24, outer.y + 120, int(outer.w * 0.54), outer.h - 210)
-        right = pygame.Rect(left.right + 18, left.y, outer.right - left.right - 42, left.h)
-        input_rect = pygame.Rect(outer.x + 24, outer.bottom - 66, outer.w - 48, 42)
+        self.draw_text("RLS Save Inspector", self.fonts["hero"], TEXT, (outer.x + 26, outer.y + 18))
+        self.draw_text(
+            "Select a save file (double-click or Enter) or enter a path below.",
+            self.fonts["body"],
+            TEXT_MUTED,
+            (outer.x + 28, outer.y + 58),
+            max_w=outer.w - 220,
+        )
 
-        self.draw_panel(left, fill=PANEL_ALT)
-        self.draw_panel(right, fill=PANEL_ALT)
-        self.draw_panel(input_rect, fill=(18, 24, 34), radius=12)
-        self._click_regions.append((input_rect, "loader_input", None))
+        refresh_btn = pygame.Rect(outer.right - 156, outer.y + 22, 130, 38)
+        refresh_hover = refresh_btn.collidepoint(mouse_pos)
+        self.draw_panel(refresh_btn, fill=PANEL_SOFT if refresh_hover else CARD_BG, radius=10, border=(95, 115, 145) if refresh_hover else (70, 82, 102))
+        self.draw_centered_text("Refresh (R)", self.fonts["small"], TEXT, refresh_btn)
+        self._click_regions.append((refresh_btn, "refresh_loader", None))
+
+        body_top = outer.y + 98
+        body_h = outer.bottom - body_top - 102
+        left_w = int(outer.w * 0.53)
+        left = pygame.Rect(outer.x + 24, body_top, left_w, body_h)
+        right = pygame.Rect(left.right + 16, body_top, outer.right - left.right - 40, body_h)
+        self.draw_panel(left, fill=PANEL_ALT, radius=16)
+        self.draw_panel(right, fill=PANEL_ALT, radius=16)
 
         self.draw_text("Save Files", self.fonts["title"], TEXT, (left.x + 18, left.y + 14))
-        self.draw_text(self.loader_message, self.fonts["small"], TEXT_MUTED, (left.x + 20, left.y + 50))
-        self.draw_text("Path input", self.fonts["small"], TEXT_FAINT, (input_rect.x + 14, input_rect.y - 18))
-        path_label = self.loader_query if self.loader_input_active or self.loader_query else "Press / and type a full or relative path, then Enter"
-        self.draw_text(path_label, self.fonts["body"], TEXT if self.loader_query else TEXT_FAINT, (input_rect.x + 14, input_rect.y + 10))
+        self.draw_text(self.loader_message, self.fonts["small"], TEXT_MUTED, (left.x + 18, left.y + 46), max_w=left.w - 36)
 
-        row_h = 74
-        visible_rows = max(1, (left.h - 84) // row_h)
+        list_rect = pygame.Rect(left.x + 12, left.y + 74, left.w - 24, left.h - 86)
+        self._loader_viewport = list_rect
+        row_h = 80
+        visible_rows = max(1, list_rect.h // row_h)
         max_scroll = max(0, len(self.loader_items) - visible_rows)
         self.loader_scroll = int(clamp(self.loader_scroll, 0, max_scroll))
         if self.loader_selection < self.loader_scroll:
@@ -1053,129 +1197,242 @@ class SaveInspectorApp:
         if self.loader_selection >= self.loader_scroll + visible_rows:
             self.loader_scroll = self.loader_selection - visible_rows + 1
 
-        for draw_index in range(visible_rows):
+        has_bar = len(self.loader_items) > visible_rows
+        card_w = list_rect.w - (14 if has_bar else 0)
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(list_rect)
+        for draw_index in range(visible_rows + 1):
             item_index = self.loader_scroll + draw_index
             if item_index >= len(self.loader_items):
                 break
             preview = self.loader_items[item_index]
-            card = pygame.Rect(left.x + 14, left.y + 80 + draw_index * row_h, left.w - 28, row_h - 10)
-            color = CARD_SELECTED if item_index == self.loader_selection else CARD_BG
-            self.draw_panel(card, fill=color, radius=14)
-            self._click_regions.append((card, "load_preview", preview))
-            self.draw_text(preview.path.name, self.fonts["body"], TEXT, (card.x + 14, card.y + 10))
-            sub = str(preview.path.relative_to(self.root)) if preview.path.is_relative_to(self.root) else str(preview.path)
-            self.draw_text(sub, self.fonts["small"], TEXT_MUTED, (card.x + 14, card.y + 36))
-            if preview.status == "ok" and preview.summary:
-                blurb = f"{preview.summary['people']} people | {preview.summary['companies']} companies | {preview.summary['date']}"
-                self.draw_text(blurb, self.fonts["small"], ACCENT, (card.right - 330, card.y + 10))
-            else:
-                self.draw_text("Unreadable", self.fonts["small"], BAD, (card.right - 110, card.y + 10))
+            card = pygame.Rect(list_rect.x, list_rect.y + draw_index * row_h, card_w, row_h - 8)
+            if card.top >= list_rect.bottom:
+                break
+            hovered = card.collidepoint(mouse_pos)
+            is_sel = item_index == self.loader_selection
+            color = CARD_SELECTED if is_sel else (CARD_HOVER if hovered else CARD_BG)
+            border = ACCENT if is_sel else ((95, 115, 145) if hovered else (62, 74, 94))
+            self.draw_panel(card, fill=color, radius=12, border=border, shadow=False)
+            self._click_regions.append((card.clip(list_rect), "select_preview", item_index))
 
+            if preview.status == "ok" and preview.summary:
+                pill_text = f"{preview.summary['people']:,} ppl"
+                pill_color = (34, 90, 65)
+                pill_fg = GOOD
+            else:
+                pill_text = "Unreadable"
+                pill_color = (92, 38, 42)
+                pill_fg = BAD
+            pill_w = self.fonts["tiny"].size(pill_text)[0] + 18
+            pill_rect = pygame.Rect(card.right - pill_w - 12, card.y + 10, pill_w, 22)
+            self.draw_panel(pill_rect, fill=pill_color, radius=7, border=pill_fg, shadow=False)
+            self.draw_centered_text(pill_text, self.fonts["tiny"], pill_fg, pill_rect)
+
+            title_w = pill_rect.x - card.x - 24
+            self.draw_text(preview.path.name, self.fonts["body"], TEXT, (card.x + 14, card.y + 10), max_w=title_w)
+
+            rel = str(preview.path.relative_to(self.root)) if preview.path.is_relative_to(self.root) else str(preview.path)
+            meta_right = f"{format_file_size(preview.size_bytes)}  •  {preview.modified}"
+            meta_w = self.fonts["tiny"].size(meta_right)[0]
+            self.draw_text(meta_right, self.fonts["tiny"], TEXT_FAINT, (card.right - meta_w - 12, card.y + 42))
+            self.draw_text(rel, self.fonts["small"], TEXT_MUTED, (card.x + 14, card.y + 40), max_w=card.w - meta_w - 36)
+        self.screen.set_clip(old_clip)
+
+        if has_bar:
+            track = pygame.Rect(list_rect.right - 8, list_rect.y, 6, list_rect.h)
+            self.draw_scrollbar(track, len(self.loader_items), visible_rows, self.loader_scroll)
+
+        self.draw_text("Preview", self.fonts["title"], TEXT, (right.x + 20, right.y + 14))
         selected = self.loader_items[self.loader_selection] if self.loader_items else None
-        self.draw_text("Preview", self.fonts["title"], TEXT, (right.x + 18, right.y + 14))
         if selected is None:
-            self.draw_text("No save selected.", self.fonts["body"], TEXT_MUTED, (right.x + 18, right.y + 70))
+            self.draw_text("No save selected.", self.fonts["body"], TEXT_MUTED, (right.x + 20, right.y + 64))
         elif selected.status != "ok" or not selected.summary:
-            self.draw_text(selected.path.name, self.fonts["body"], TEXT, (right.x + 18, right.y + 70))
-            self.draw_text(selected.error or "This file could not be decoded.", self.fonts["body"], BAD, (right.x + 18, right.y + 110))
+            self.draw_text(selected.path.name, self.fonts["section"], TEXT, (right.x + 20, right.y + 60), max_w=right.w - 40)
+            self.draw_text(
+                f"{format_file_size(selected.size_bytes)}  •  Modified {selected.modified}",
+                self.fonts["small"],
+                TEXT_FAINT,
+                (right.x + 20, right.y + 92),
+                max_w=right.w - 40,
+            )
+            err_box = pygame.Rect(right.x + 20, right.y + 128, right.w - 40, 120)
+            self.draw_panel(err_box, fill=(46, 26, 30), radius=12, border=BAD, shadow=False)
+            y_err = err_box.y + 14
+            for line in self.wrap_text(selected.error or "This file could not be decoded.", self.fonts["body"], err_box.w - 28)[:4]:
+                self.draw_text(line, self.fonts["body"], BAD, (err_box.x + 14, y_err))
+                y_err += 24
         else:
             summary = selected.summary
-            self.draw_text(selected.path.name, self.fonts["title"], TEXT, (right.x + 18, right.y + 64))
-            meta = [
-                f"Schema {summary['schema']}",
-                f"Seed {summary['seed']}",
-                f"World {summary['world_seed']}",
-                summary["date"],
-                summary["weather"],
+            self.draw_text(selected.path.name, self.fonts["section"], TEXT, (right.x + 20, right.y + 56), max_w=right.w - 40)
+            meta_lines = [
+                f"Date: {summary['date']}   |   Schema v{summary['schema']}",
+                f"Weather: {summary['weather']}",
+                f"Seed: {summary['seed']}   |   World: {summary['world_seed']}   |   {format_file_size(selected.size_bytes)}",
             ]
-            y = right.y + 110
-            for line in meta:
-                self.draw_text(line, self.fonts["body"], TEXT_MUTED, (right.x + 18, y))
-                y += 32
+            y_meta = right.y + 88
+            for line in meta_lines:
+                self.draw_text(line, self.fonts["small"], TEXT_MUTED, (right.x + 20, y_meta), max_w=right.w - 40)
+                y_meta += 24
+
             stats = [
-                ("People", summary["people"]),
-                ("Households", summary["households"]),
-                ("Companies", summary["companies"]),
-                ("Districts", summary["districts"]),
-                ("Buildings", summary["buildings"]),
-                ("Transit", summary["transit"]),
-                ("Stocks", summary["stocks"]),
-                ("News", summary["news"]),
-                ("Timeline", summary["timeline"]),
+                ("People", f"{summary['people']:,}"),
+                ("Households", f"{summary['households']:,}"),
+                ("Companies", f"{summary['companies']:,}"),
+                ("Districts", f"{summary['districts']:,}"),
+                ("Buildings", f"{summary['buildings']:,}"),
+                ("Transit", f"{summary['transit']:,}"),
+                ("Stocks", f"{summary['stocks']:,}"),
+                ("News", f"{summary['news']:,}"),
+                ("Timeline", f"{summary['timeline']:,}"),
             ]
-            cols = 2
-            card_w = (right.w - 54) // cols
+            grid_top = y_meta + 12
+            btn_h = 42
+            grid_bottom = right.bottom - btn_h - 32
+            cols = 3
+            rows = 3
+            gap_x, gap_y = 12, 12
+            card_w = (right.w - 40 - gap_x * (cols - 1)) // cols
+            card_h = max(54, min(74, (grid_bottom - grid_top - gap_y * (rows - 1)) // rows))
             for idx, (label, value) in enumerate(stats):
                 col = idx % cols
                 row = idx // cols
-                rect = pygame.Rect(right.x + 18 + col * (card_w + 18), right.y + 280 + row * 86, card_w, 70)
-                self.draw_panel(rect, fill=CARD_BG, radius=14)
-                self.draw_text(label, self.fonts["small"], TEXT_MUTED, (rect.x + 12, rect.y + 10))
-                self.draw_text(str(value), self.fonts["title"], TEXT, (rect.x + 12, rect.y + 28))
+                rect = pygame.Rect(
+                    right.x + 20 + col * (card_w + gap_x),
+                    grid_top + row * (card_h + gap_y),
+                    card_w,
+                    card_h,
+                )
+                self.draw_panel(rect, fill=CARD_BG, radius=12, border=(56, 68, 88), shadow=False)
+                self.draw_text(label, self.fonts["tiny"], TEXT_MUTED, (rect.x + 12, rect.y + 8))
+                self.draw_text(value, self.fonts["title"], TEXT, (rect.x + 12, rect.y + 26), max_w=rect.w - 24)
 
-        help_text = "Controls: Up/Down select  Enter load  R refresh  / path input  Esc quit"
-        self.draw_text(help_text, self.fonts["small"], TEXT_FAINT, (outer.x + 28, outer.bottom - 92))
+            open_btn = pygame.Rect(right.x + 20, right.bottom - btn_h - 16, right.w - 40, btn_h)
+            open_hover = open_btn.collidepoint(mouse_pos)
+            self.draw_panel(open_btn, fill=ACCENT if open_hover else ACCENT_DIM, radius=12, border=ACCENT, shadow=False)
+            self.draw_centered_text("Inspect Save (Enter)", self.fonts["body"], TEXT, open_btn)
+            self._click_regions.append((open_btn, "open_selected_preview", None))
+
+        input_label_y = outer.bottom - 88
+        self.draw_text("Open by path (press / or click):", self.fonts["tiny"], TEXT_FAINT, (outer.x + 26, input_label_y))
+        input_rect = pygame.Rect(outer.x + 24, outer.bottom - 68, outer.w - 48, 38)
+        input_border = ACCENT if self.loader_input_active else (64, 76, 98)
+        self.draw_panel(input_rect, fill=(16, 22, 32), radius=10, border=input_border, shadow=False)
+        self._click_regions.append((input_rect, "loader_input", None))
+        if self.loader_input_active or self.loader_query:
+            cursor = "|" if (self.loader_input_active and (pygame.time.get_ticks() // 500) % 2 == 0) else ""
+            path_label = self.loader_query + cursor
+            path_color = TEXT
+        else:
+            path_label = "Press / and type a full or relative path to a save file, then press Enter"
+            path_color = TEXT_FAINT
+        self.draw_text(path_label, self.fonts["body"], path_color, (input_rect.x + 12, input_rect.y + 8), max_w=input_rect.w - 24)
+
+        help_text = "Up/Down select  •  Enter / Double-click load  •  R refresh  •  / path input  •  Esc quit"
+        self.draw_text(help_text, self.fonts["tiny"], TEXT_FAINT, (outer.x + 26, outer.bottom - 22), max_w=outer.w - 52)
 
     def draw_browser(self) -> None:
         if not self.index:
             return
         width, height = self.screen.get_size()
-        self.draw_gradient((0, 0, width, height), (10, 17, 24), (23, 30, 43))
-        top = pygame.Rect(22, 18, width - 44, 110)
-        left = pygame.Rect(22, 144, 520, height - 166)
-        right = pygame.Rect(left.right + 18, 144, width - left.right - 40, height - 166)
-        self.draw_panel(top, radius=24)
-        self.draw_panel(left, radius=24)
-        self.draw_panel(right, radius=24)
+        mouse_pos = pygame.mouse.get_pos()
+        self.draw_gradient((0, 0, width, height), (10, 16, 24), (21, 29, 41))
+
+        top = pygame.Rect(18, 14, width - 36, 78)
+        footer_h = 26
+        body_top = top.bottom + 12
+        body_h = height - body_top - footer_h - 14
+        left_w = int(clamp(width * 0.37, 440, 560))
+        left = pygame.Rect(18, body_top, left_w, body_h)
+        right = pygame.Rect(left.right + 14, body_top, width - left.right - 32, body_h)
+
+        self.draw_panel(top, fill=PANEL_BG, radius=16)
+        self.draw_panel(left, fill=PANEL_BG, radius=16)
+        self.draw_panel(right, fill=PANEL_BG, radius=16)
 
         summary = self.index.summary
-        self.draw_text(self.index.path.name, self.fonts["hero"], TEXT, (top.x + 22, top.y + 14))
-        subtitle = f"{summary['date']} | {summary['weather']} | {summary['people']} people | {summary['companies']} companies | schema {summary['schema']}"
-        self.draw_text(subtitle, self.fonts["body"], TEXT_MUTED, (top.x + 24, top.y + 62))
-
-        open_button = pygame.Rect(top.right - 188, top.y + 20, 160, 44)
-        self.draw_panel(open_button, fill=ACCENT_DIM, radius=14)
-        self.draw_text("Load Another", self.fonts["body"], TEXT, (open_button.x + 20, open_button.y + 10))
+        open_button = pygame.Rect(top.right - 184, top.y + 18, 164, 42)
+        open_hover = open_button.collidepoint(mouse_pos)
+        self.draw_panel(open_button, fill=ACCENT if open_hover else ACCENT_DIM, radius=12, border=ACCENT, shadow=False)
+        self.draw_centered_text("Load Save (Ctrl+L)", self.fonts["small"], TEXT, open_button)
         self._click_regions.append((open_button, "open_loader", None))
 
-        search_rect = pygame.Rect(left.x + 18, left.y + 18, left.w - 36, 42)
-        self.draw_panel(search_rect, fill=(18, 24, 34), radius=12)
-        query = self.search_text if self.search_text else "Type to search names, ids, jobs, sectors, districts, symbols, headlines..."
-        self.draw_text(query, self.fonts["body"], TEXT if self.search_text else TEXT_FAINT, (search_rect.x + 12, search_rect.y + 10))
+        header_max_w = open_button.x - top.x - 36
+        self.draw_text(self.index.path.name, self.fonts["title"], TEXT, (top.x + 20, top.y + 12), max_w=header_max_w)
+        subtitle = (
+            f"{summary['date']}  •  {summary['weather']}  •  {summary['people']:,} people  •  "
+            f"{summary['companies']:,} companies  •  schema v{summary['schema']}"
+        )
+        self.draw_text(subtitle, self.fonts["small"], TEXT_MUTED, (top.x + 20, top.y + 46), max_w=header_max_w)
 
-        tab_x = left.x + 18
-        tab_y = left.y + 74
+        # ---- Left panel: Search, Categories, Sort, Results ----
+        search_rect = pygame.Rect(left.x + 14, left.y + 14, left.w - 28, 38)
+        self.draw_panel(search_rect, fill=(16, 22, 32), radius=10, border=ACCENT_DIM if self.search_text else (64, 76, 98), shadow=False)
+        clear_reserve = 0
+        if self.search_text:
+            clear_rect = pygame.Rect(search_rect.right - 30, search_rect.y + 6, 24, 26)
+            clear_hover = clear_rect.collidepoint(mouse_pos)
+            self.draw_panel(clear_rect, fill=PANEL_SOFT if clear_hover else CARD_BG, radius=6, border=(80, 94, 118), shadow=False)
+            self.draw_centered_text("x", self.fonts["small"], TEXT, clear_rect)
+            self._click_regions.append((clear_rect, "clear_search", None))
+            clear_reserve = 34
+        cursor = "|" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+        query = (self.search_text + cursor) if self.search_text else "Search names, IDs, jobs, sectors, districts, symbols..."
+        self.draw_text(
+            query,
+            self.fonts["body"],
+            TEXT if self.search_text else TEXT_FAINT,
+            (search_rect.x + 12, search_rect.y + 8),
+            max_w=search_rect.w - 24 - clear_reserve,
+        )
+
+        tab_x = left.x + 14
+        tab_y = search_rect.bottom + 10
+        tab_h = 26
         for category in self.category_tabs:
             label = category.title()
-            tab_w = max(72, self.fonts["small"].size(label)[0] + 28)
-            rect = pygame.Rect(tab_x, tab_y, tab_w, 30)
-            fill = ACCENT_DIM if category == self.selected_category else PANEL_SOFT
-            self.draw_panel(rect, fill=fill, radius=11)
-            self.draw_text(label, self.fonts["small"], TEXT, (rect.x + 12, rect.y + 7))
+            tab_w = max(56, self.fonts["tiny"].size(label)[0] + 20)
+            if tab_x + tab_w > left.right - 14:
+                tab_x = left.x + 14
+                tab_y += tab_h + 6
+            rect = pygame.Rect(tab_x, tab_y, tab_w, tab_h)
+            active = category == self.selected_category
+            hovered = rect.collidepoint(mouse_pos)
+            fill = ACCENT_DIM if active else (CARD_HOVER if hovered else PANEL_SOFT)
+            border = ACCENT if active else (70, 82, 102)
+            self.draw_panel(rect, fill=fill, radius=8, border=border, shadow=False)
+            self.draw_centered_text(label, self.fonts["tiny"], TEXT, rect)
             self._click_regions.append((rect, "select_category", category))
-            tab_x += tab_w + 8
-            if tab_x > left.right - 120:
-                tab_x = left.x + 18
-                tab_y += 38
+            tab_x += tab_w + 6
 
-        sort_y = tab_y + 44
-        self.draw_text("Sort", self.fonts["small"], TEXT_FAINT, (left.x + 18, sort_y))
-        sort_x = left.x + 60
+        sort_y = tab_y + tab_h + 12
+        self.draw_text("Sort:", self.fonts["tiny"], TEXT_FAINT, (left.x + 14, sort_y + 5))
+        sort_x = left.x + 52
         for key, label in self.current_sort_options():
-            rect = pygame.Rect(sort_x, sort_y - 6, max(72, self.fonts["small"].size(label)[0] + 24), 28)
-            fill = ACCENT_DIM if key == self.sort_key else PANEL_SOFT
-            self.draw_panel(rect, fill=fill, radius=10)
-            self.draw_text(label, self.fonts["small"], TEXT, (rect.x + 10, rect.y + 6))
+            btn_w = max(56, self.fonts["tiny"].size(label)[0] + 18)
+            if sort_x + btn_w > left.right - 14:
+                sort_x = left.x + 52
+                sort_y += 28
+            rect = pygame.Rect(sort_x, sort_y, btn_w, 24)
+            active = key == self.sort_key
+            hovered = rect.collidepoint(mouse_pos)
+            fill = ACCENT_DIM if active else (CARD_HOVER if hovered else PANEL_SOFT)
+            border = ACCENT if active else (70, 82, 102)
+            self.draw_panel(rect, fill=fill, radius=7, border=border, shadow=False)
+            self.draw_centered_text(label, self.fonts["tiny"], TEXT, rect)
             self._click_regions.append((rect, "select_sort", key))
-            sort_x += rect.w + 8
+            sort_x += btn_w + 6
 
         records = self.filtered_records()
-        count_label = f"{len(records)} matches in {self.selected_category}"
-        self.draw_text(count_label, self.fonts["small"], TEXT_MUTED, (left.x + 18, sort_y + 34))
+        count_y = sort_y + 32
+        count_label = f"{len(records):,} match{'es' if len(records) != 1 else ''} in {self.selected_category}"
+        self.draw_text(count_label, self.fonts["tiny"], TEXT_MUTED, (left.x + 14, count_y), max_w=left.w - 140)
+        self.draw_text("F2 sort  •  Tab category", self.fonts["tiny"], TEXT_FAINT, (left.right - 150, count_y))
 
-        list_top = sort_y + 62
-        row_h = 82
-        visible_rows = max(1, (left.bottom - list_top - 16) // row_h)
+        list_rect = pygame.Rect(left.x + 12, count_y + 22, left.w - 24, left.bottom - count_y - 34)
+        self._list_viewport = list_rect
+        row_h = 84
+        visible_rows = max(1, list_rect.h // row_h)
         max_scroll = max(0, len(records) - visible_rows)
         self.result_scroll = int(clamp(self.result_scroll, 0, max_scroll))
         if self.result_selection < self.result_scroll:
@@ -1183,87 +1440,202 @@ class SaveInspectorApp:
         if self.result_selection >= self.result_scroll + visible_rows:
             self.result_scroll = self.result_selection - visible_rows + 1
 
-        for draw_index in range(visible_rows):
+        has_list_bar = len(records) > visible_rows
+        card_w = list_rect.w - (14 if has_list_bar else 0)
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(list_rect)
+        for draw_index in range(visible_rows + 1):
             item_index = self.result_scroll + draw_index
             if item_index >= len(records):
                 break
             record = records[item_index]
-            rect = pygame.Rect(left.x + 16, list_top + draw_index * row_h, left.w - 32, row_h - 10)
-            fill = CARD_SELECTED if item_index == self.result_selection else CARD_BG
-            self.draw_panel(rect, fill=fill, radius=16)
-            self._click_regions.append((rect, "select_result", item_index))
-            self.draw_text(record.title, self.fonts["body"], TEXT, (rect.x + 14, rect.y + 10))
-            self.draw_text(record.subtitle, self.fonts["small"], TEXT_MUTED, (rect.x + 14, rect.y + 38))
-            badge_x = rect.x + 14
-            badge_y = rect.y + 56
+            rect = pygame.Rect(list_rect.x, list_rect.y + draw_index * row_h, card_w, row_h - 8)
+            if rect.top >= list_rect.bottom:
+                break
+            hovered = rect.collidepoint(mouse_pos)
+            is_sel = item_index == self.result_selection
+            fill = CARD_SELECTED if is_sel else (CARD_HOVER if hovered else CARD_BG)
+            border = ACCENT if is_sel else ((95, 115, 145) if hovered else (58, 70, 88))
+            self.draw_panel(rect, fill=fill, radius=12, border=border, shadow=False)
+            self._click_regions.append((rect.clip(list_rect), "select_result", item_index))
+
+            id_tag = f"#{record.record_id}"
+            id_w = self.fonts["tiny"].size(id_tag)[0]
+            self.draw_text(id_tag, self.fonts["tiny"], TEXT_FAINT, (rect.right - id_w - 12, rect.y + 10))
+            self.draw_text(record.title, self.fonts["body"], TEXT, (rect.x + 12, rect.y + 8), max_w=rect.w - id_w - 32)
+            self.draw_text(record.subtitle, self.fonts["tiny"], TEXT_MUTED, (rect.x + 12, rect.y + 30), max_w=rect.w - 24)
+
+            badge_x = rect.x + 12
+            badge_y = rect.y + 49
             for badge in record.badges[:3]:
                 badge_text = preview_value(badge, 18)
-                badge_w = self.fonts["small"].size(badge_text)[0] + 16
-                badge_rect = pygame.Rect(badge_x, badge_y, badge_w, 20)
-                self.draw_panel(badge_rect, fill=(32, 66, 92), radius=8)
-                self.draw_text(badge_text, self.fonts["small"], TEXT, (badge_rect.x + 8, badge_rect.y + 3))
-                badge_x += badge_w + 8
+                if not badge_text:
+                    continue
+                badge_w = self.fonts["tiny"].size(badge_text)[0] + 14
+                if badge_x + badge_w > rect.right - 10:
+                    break
+                badge_rect = pygame.Rect(badge_x, badge_y, badge_w, 19)
+                self.draw_panel(badge_rect, fill=(32, 62, 88), radius=6, border=(56, 102, 142), shadow=False)
+                self.draw_centered_text(badge_text, self.fonts["tiny"], TEXT, badge_rect)
+                badge_x += badge_w + 6
+        self.screen.set_clip(old_clip)
 
+        if has_list_bar:
+            track = pygame.Rect(list_rect.right - 8, list_rect.y, 6, list_rect.h)
+            self.draw_scrollbar(track, len(records), visible_rows, self.result_scroll)
+
+        # ---- Right panel: Detail View ----
         record = self.selected_record()
         if record is None:
             self.draw_text("No matching records.", self.fonts["title"], TEXT, (right.x + 24, right.y + 24))
+            self.draw_text("Try clearing or broadening your search query.", self.fonts["body"], TEXT_MUTED, (right.x + 24, right.y + 60))
+        else:
+            cat_badge = f"{record.category.title()}  #{record.record_id}"
+            cat_w = self.fonts["small"].size(cat_badge)[0] + 20
+            cat_rect = pygame.Rect(right.right - cat_w - 22, right.y + 20, cat_w, 28)
+            self.draw_panel(cat_rect, fill=(32, 66, 94), radius=8, border=ACCENT_DIM, shadow=False)
+            self.draw_centered_text(cat_badge, self.fonts["small"], ACCENT, cat_rect)
+
+            self.draw_text(record.title, self.fonts["hero"], TEXT, (right.x + 22, right.y + 16), max_w=cat_rect.x - right.x - 32)
+            self.draw_text(record.subtitle, self.fonts["body"], TEXT_MUTED, (right.x + 22, right.y + 56), max_w=right.w - 44)
+            pygame.draw.line(self.screen, (55, 67, 86), (right.x + 20, right.y + 90), (right.right - 20, right.y + 90), 1)
+
+            viewport = pygame.Rect(right.x + 18, right.y + 100, right.w - 36, right.h - 114)
+            self._detail_viewport = viewport
+            col_gap = 22
+            content_w = viewport.w - 14
+            col_a_w = max(260, int(content_w * 0.46))
+            col_b_w = max(240, content_w - col_a_w - col_gap)
+            col_a_x = viewport.x
+            col_b_x = col_a_x + col_a_w + col_gap
+
+            # Precompute vertical flow height for both columns so scrolling covers everything
+            snap_h = 34 + len(record.details) * 28
+            sec_h = 0
+            wrapped_sections: List[Tuple[str, List[str]]] = []
+            for sec_title, sec_lines in record.sections:
+                sec_wrapped: List[str] = []
+                for line in sec_lines:
+                    sec_wrapped.extend(self.wrap_text(str(line), self.fonts["small"], col_b_w - 16))
+                wrapped_sections.append((sec_title, sec_wrapped))
+                sec_h += 34 + max(1, len(sec_wrapped)) * 20 + 18
+
+            total_content_h = max(snap_h, sec_h)
+            self._detail_max_scroll = max(0, total_content_h - viewport.h)
+            self.detail_scroll = int(clamp(self.detail_scroll, 0, self._detail_max_scroll))
+
+            old_clip = self.screen.get_clip()
+            self.screen.set_clip(viewport)
+            y_a = viewport.y - self.detail_scroll
+            self.draw_text("Snapshot", self.fonts["section"], TEXT, (col_a_x, y_a))
+            y_a += 34
+            label_w = 136
+            val_max_w = max(100, col_a_w - label_w - 16)
+            for idx, (label, value) in enumerate(record.details):
+                row_rect = pygame.Rect(col_a_x, y_a, col_a_w, 26)
+                if row_rect.bottom >= viewport.top and row_rect.top <= viewport.bottom:
+                    if idx % 2 == 0:
+                        pygame.draw.rect(self.screen, (28, 36, 49), row_rect, border_radius=6)
+                    self.draw_text(label, self.fonts["small"], TEXT_FAINT, (row_rect.x + 8, row_rect.y + 4), max_w=label_w - 8)
+                    self.draw_text(value, self.fonts["body"], TEXT, (row_rect.x + label_w, row_rect.y + 2), max_w=val_max_w)
+                y_a += 28
+
+            y_b = viewport.y - self.detail_scroll
+            for sec_title, sec_wrapped in wrapped_sections:
+                if y_b + 30 >= viewport.top and y_b <= viewport.bottom:
+                    self.draw_text(sec_title, self.fonts["section"], TEXT, (col_b_x, y_b))
+                    pygame.draw.line(self.screen, (52, 64, 82), (col_b_x, y_b + 26), (col_b_x + col_b_w, y_b + 26), 1)
+                y_b += 34
+                for seg in sec_wrapped:
+                    if y_b + 20 >= viewport.top and y_b <= viewport.bottom:
+                        self.draw_text(seg, self.fonts["small"], TEXT_MUTED, (col_b_x + 4, y_b))
+                    y_b += 20
+                y_b += 18
+            self.screen.set_clip(old_clip)
+
+            if self._detail_max_scroll > 0:
+                track = pygame.Rect(viewport.right - 6, viewport.y, 6, viewport.h)
+                self.draw_scrollbar(track, total_content_h, viewport.h, self.detail_scroll)
+
+        footer_y = height - footer_h - 6
+        self.draw_text(self.status_message, self.fonts["tiny"], TEXT_FAINT, (22, footer_y + 4), max_w=width - 44)
+
+    def draw_scrollbar(self, track: pygame.Rect, total: int, visible: int, offset: int) -> None:
+        if total <= 0 or total <= visible or track.h <= 8:
             return
+        pygame.draw.rect(self.screen, (26, 33, 46), track, border_radius=3)
+        thumb_h = max(24, int(track.h * (visible / total)))
+        max_off = max(1, total - visible)
+        thumb_y = track.y + int((track.h - thumb_h) * (offset / max_off))
+        pygame.draw.rect(self.screen, (88, 108, 138), pygame.Rect(track.x, thumb_y, track.w, thumb_h), border_radius=3)
 
-        self.draw_text(record.title, self.fonts["hero"], TEXT, (right.x + 24, right.y + 24))
-        self.draw_text(f"{record.category.title()} #{record.record_id}", self.fonts["body"], ACCENT, (right.x + 26, right.y + 70))
-        self.draw_text(record.subtitle, self.fonts["body"], TEXT_MUTED, (right.x + 26, right.y + 102))
-
-        column_a = pygame.Rect(right.x + 24, right.y + 144, (right.w - 72) // 2, right.h - 170)
-        column_b = pygame.Rect(column_a.right + 24, column_a.y, column_a.w, column_a.h)
-
-        self.draw_text("Snapshot", self.fonts["title"], TEXT, (column_a.x, column_a.y))
-        y = column_a.y + 42
-        for label, value in record.details:
-            self.draw_text(label, self.fonts["small"], TEXT_FAINT, (column_a.x, y))
-            self.draw_text(value, self.fonts["body"], TEXT, (column_a.x + 150, y - 4))
-            y += 28
-            if y > column_a.bottom - 40:
-                break
-
-        section_y = column_b.y
-        for title, lines in record.sections:
-            self.draw_text(title, self.fonts["title"], TEXT, (column_b.x, section_y))
-            section_y += 34
-            for line in lines[:8]:
-                wrapped = self.wrap_text(line, self.fonts["small"], column_b.w)
-                for segment in wrapped[:2]:
-                    self.draw_text(segment, self.fonts["small"], TEXT_MUTED, (column_b.x, section_y))
-                    section_y += 20
-                if section_y > column_b.bottom - 40:
-                    break
-            section_y += 16
-            if section_y > column_b.bottom - 40:
-                break
-
-        footer = pygame.Rect(22, height - 48, width - 44, 28)
-        self.draw_text(self.status_message, self.fonts["small"], TEXT_FAINT, (footer.x + 8, footer.y))
-
-    def draw_panel(self, rect: pygame.Rect, fill: Tuple[int, int, int] = PANEL_BG, radius: int = 18) -> None:
-        shadow_rect = rect.move(0, 4)
-        pygame.draw.rect(self.screen, SHADOW, shadow_rect, border_radius=radius)
+    def draw_panel(
+        self,
+        rect: pygame.Rect,
+        fill: Tuple[int, int, int] = PANEL_BG,
+        radius: int = 16,
+        border: Tuple[int, int, int] = (64, 76, 96),
+        shadow: bool = True,
+    ) -> None:
+        if shadow:
+            pygame.draw.rect(self.screen, SHADOW, rect.move(0, 3), border_radius=radius)
         pygame.draw.rect(self.screen, fill, rect, border_radius=radius)
-        pygame.draw.rect(self.screen, (70, 82, 102), rect, width=1, border_radius=radius)
+        pygame.draw.rect(self.screen, border, rect, width=1, border_radius=radius)
 
-    def draw_text(self, text: str, font: pygame.font.Font, color: Tuple[int, int, int], pos: Tuple[int, int]) -> None:
-        surface = font.render(text, True, color)
+    def fit_text(self, text: str, font: pygame.font.Font, max_w: int) -> str:
+        if max_w <= 10:
+            return ""
+        if font.size(text)[0] <= max_w:
+            return text
+        ellipsis = "..."
+        ell_w = font.size(ellipsis)[0]
+        if ell_w >= max_w:
+            return ""
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid])[0] + ell_w <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + ellipsis
+
+    def draw_text(
+        self,
+        text: str,
+        font: pygame.font.Font,
+        color: Tuple[int, int, int],
+        pos: Tuple[int, int],
+        max_w: Optional[int] = None,
+    ) -> None:
+        rendered = self.fit_text(text, font, max_w) if max_w is not None else text
+        if not rendered:
+            return
+        surface = font.render(rendered, True, color)
         self.screen.blit(surface, pos)
+
+    def draw_centered_text(self, text: str, font: pygame.font.Font, color: Tuple[int, int, int], rect: pygame.Rect) -> None:
+        rendered = self.fit_text(text, font, rect.w - 8)
+        if not rendered:
+            return
+        surface = font.render(rendered, True, color)
+        self.screen.blit(surface, surface.get_rect(center=rect.center))
 
     def draw_gradient(self, rect_like: Tuple[int, int, int, int], top_color: Tuple[int, int, int], bottom_color: Tuple[int, int, int]) -> None:
         rect = pygame.Rect(rect_like)
-        target = pygame.Surface((rect.w, rect.h))
-        for y in range(rect.h):
-            blend = y / max(1, rect.h - 1)
-            color = (
-                int(top_color[0] * (1 - blend) + bottom_color[0] * blend),
-                int(top_color[1] * (1 - blend) + bottom_color[1] * blend),
-                int(top_color[2] * (1 - blend) + bottom_color[2] * blend),
-            )
-            pygame.draw.line(target, color, (0, y), (rect.w, y))
+        key = (rect.w, rect.h, top_color, bottom_color)
+        target = self._grad_cache.get(key)
+        if target is None:
+            target = pygame.Surface((rect.w, rect.h))
+            for y in range(rect.h):
+                blend = y / max(1, rect.h - 1)
+                color = (
+                    int(top_color[0] * (1 - blend) + bottom_color[0] * blend),
+                    int(top_color[1] * (1 - blend) + bottom_color[1] * blend),
+                    int(top_color[2] * (1 - blend) + bottom_color[2] * blend),
+                )
+                pygame.draw.line(target, color, (0, y), (rect.w, y))
+            self._grad_cache = {key: target}
         self.screen.blit(target, rect.topleft)
 
     def wrap_text(self, text: str, font: pygame.font.Font, width: int) -> List[str]:

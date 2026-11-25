@@ -331,6 +331,7 @@ class Company:
     min_headcount: int = 4
     target_headcount: int = 12
     max_headcount: int = 18
+    public: bool = False
 
     def health_score(self) -> float:
         liquidity = clamp(self.cash / max(1.0, self.payroll_budget), 0.0, 1.0)
@@ -497,7 +498,9 @@ class WorldMap:
         self._assign_zones()
         self._stamp_landmarks()
         self._generate_buildings()
+        self._ensure_civic_minimums()
         self._generate_companies()
+        self._generate_civic_companies()
         self._generate_housing_market()
         self._balance_housing()
         self._generate_job_market()
@@ -896,17 +899,17 @@ class WorldMap:
         if zone == "industrial":
             return "factory" if r < 0.6 else "warehouse"
         if zone == "civic":
-            if r < 0.34:
+            if r < 0.32:
                 return "school"
-            if r < 0.46:
+            if r < 0.42:
                 return "college"
-            if r < 0.62:
+            if r < 0.54:
                 return "police"
-            if r < 0.78:
+            if r < 0.70:
                 return "hospital"
-            if r < 0.97:
+            if r < 0.86:
                 return "station"
-            return "court" if r < 0.985 else "prison"
+            return "court" if r < 0.95 else "prison"
         if zone == "mixed_use":
             return self.rng.choice(["apartment", "shop", "office", "apartment"])
         urban = tile.terrain == "urban"
@@ -1007,6 +1010,86 @@ class WorldMap:
             self.districts[company.district_id].company_ids.append(company.company_id)
             self._company_counter += 1
 
+    def _ensure_civic_minimums(self) -> None:
+        """Every city needs at least a courthouse, a prison, a precinct, a hospital and a school."""
+        need = {"court": 1, "prison": 1, "police": 1, "hospital": 1, "school": 1, "college": 1}
+        counts: Dict[str, int] = {}
+        for b in self.buildings.values():
+            counts[b.building_type] = counts.get(b.building_type, 0) + 1
+        donors = sorted((b for b in self.buildings.values() if b.building_type in ("office", "station", "warehouse")),
+                        key=lambda b: b.building_id)
+        for btype, minimum in need.items():
+            while counts.get(btype, 0) < minimum and donors:
+                b = donors.pop(0)
+                counts[b.building_type] -= 1
+                b.building_type = btype
+                b.owner_kind = "city"
+                b.company_id = None
+                counts[btype] = counts.get(btype, 0) + 1
+        self._building_type_index = {}
+        for b in self.buildings.values():
+            self._building_type_index.setdefault(b.building_type, []).append(b)
+
+    CIVIC_SECTORS = {"school": "education", "college": "education", "police": "public_service",
+                     "court": "public_service", "prison": "public_service", "station": "transport"}
+    CIVIC_STAFF = {"school": (3, 7), "college": (8, 20), "police": (3, 7), "court": (8, 16),
+                   "prison": (8, 16), "station": (3, 7)}
+    CIVIC_NAMES = {"school": "School", "college": "College", "police": "Police Precinct",
+                   "court": "Courthouse", "prison": "Correctional Facility", "station": "Transit Authority"}
+
+    def _generate_civic_companies(self) -> None:
+        """Public institutions get real payrolls so teachers, officers, judges and
+        guards are ordinary employees working shifts in their building."""
+        for building in sorted(self.buildings.values(), key=lambda b: b.building_id):
+            sector = self.CIVIC_SECTORS.get(building.building_type)
+            if sector is None or building.company_id is not None:
+                continue
+            lo, hi = self.CIVIC_STAFF[building.building_type]
+            target = self.rng.randint(lo, hi)
+            building.job_slots = max(building.job_slots, target + 6)
+            district = self.districts.get(building.district_id)
+            dname = district.name if district is not None else "City"
+            company = Company(
+                company_id=self._company_counter,
+                name=f"{dname} {self.CIVIC_NAMES[building.building_type]} {building.building_id}",
+                sector=sector,
+                district_id=building.district_id,
+                building_id=building.building_id,
+                market_value=1_000_000.0,
+                cash=5_000_000.0,
+                payroll_budget=target * 3000.0,
+                productivity=0.7,
+                demand=0.7,
+                supply=0.6,
+                prestige=0.6,
+                company_scale="standard",
+                stock_symbol=self._make_stock_symbol(sector),
+                shift_templates=self._default_shifts_for_sector("public_service" if sector == "public_service" else sector),
+                expansion_desire=0.1,
+                bankruptcy_risk=0.0,
+                min_headcount=max(4, target // 2),
+                target_headcount=target,
+                max_headcount=target + 6,
+                public=True,
+            )
+            building.company_id = company.company_id
+            self.companies[company.company_id] = company
+            if district is not None:
+                district.company_ids.append(company.company_id)
+            self._company_counter += 1
+
+    CIVIC_TITLES = {
+        "school": ["Teacher", "Teacher", "Teacher", "Counselor", "Principal"],
+        "college": ["Professor", "Lecturer", "Registrar"],
+        "police": ["Police Officer", "Police Officer", "Detective", "Sergeant"],
+        "court": ["Judge", "Prosecutor", "Public Defender", "Court Clerk"],
+        "prison": ["Prison Guard", "Prison Guard", "Warden"],
+        "station": ["Conductor", "Planner", "Mechanic"],
+        "hospital": ["Doctor", "Nurse", "Nurse", "Technician", "Surgeon"],
+    }
+    CIVIC_SKILLS = {"school": "teaching", "college": "teaching", "police": "law", "court": "law",
+                    "prison": "law", "station": "transport", "hospital": "medicine"}
+
     def _balance_housing(self) -> None:
         """Thin out surplus residential lots so vacancy stays plausible (~25-35%)."""
         target_jobs = sum(c.target_headcount for c in self.companies.values())
@@ -1088,12 +1171,15 @@ class WorldMap:
         }
         for company in self.companies.values():
             target_posts = min(company.max_headcount, max(1, company.min_headcount // 3))
+            site = self.buildings.get(company.building_id)
+            btype = site.building_type if site is not None else ""
             for _ in range(target_posts):
-                title = self.rng.choice(titles_by_sector[company.sector])
+                titles = self.CIVIC_TITLES.get(btype) or titles_by_sector[company.sector]
+                title = self.rng.choice(titles)
                 self.add_job_posting(
                     company,
                     title=title,
-                    required_skill=skill_by_sector[company.sector],
+                    required_skill=self.CIVIC_SKILLS.get(btype) or skill_by_sector[company.sector],
                     salary=round(self.rng.uniform(1800, 8500), 2),
                     required_level=round(self.rng.uniform(0.1, 0.8), 2),
                     shift=self.rng.choice(company.shift_templates or [(9, 17)]),
@@ -1809,7 +1895,7 @@ class WorldMap:
             "office": 0.16,
             "factory": 0.48,
             "warehouse": 0.38,
-            "hospital": 0.24,
+            "hospital": 1.0,
         }
         return chances.get(building.building_type, 0.2)
 

@@ -13,6 +13,8 @@ import random
 from dataclasses import dataclass, field
 
 import numpy as np
+
+from movement import drive_batch, drive_vehicle, signal_array
 from typing import Any, Dict, List, Optional, Tuple
 
 from world import (
@@ -66,11 +68,25 @@ WORK_TRAIT_KEYS = [
 FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Avery", "Casey", "Cameron", "Parker", "Riley", "Quinn",
     "Elliot", "Reese", "Devon", "Hayden", "Rowan", "Skyler", "Drew", "Sam", "Jamie", "Logan",
+    "Maya", "Noah", "Priya", "Liam", "Sofia", "Mateo", "Amara", "Ethan", "Zara", "Omar", "Lena", "Kai", "Nora", "Theo",
+    "Aisha", "Felix", "Ingrid", "Raj", "Camila", "Isaac", "Yuki", "Hana", "Diego", "Freya", "Ahmed", "Clara", "Marcus",
+    "Esme", "Tariq", "Greta", "Jonas", "Leila", "Oscar", "Mina", "Bruno", "Alma", "Idris", "Vera", "Caleb", "Dalia",
+    "Emil", "Farah", "Gideon", "Helena", "Ivan", "Junia", "Kofi", "Lucia", "Milo", "Nadia", "Orla", "Pablo", "Rina",
+    "Silas", "Tessa", "Ugo", "Vikram", "Wren", "Xavier", "Yara", "Zane", "Anika", "Bashir", "Celia", "Dario", "Elif",
+    "Florin", "Gia", "Hugo", "Imani", "Joaquin", "Katya", "Lior", "Mabel", "Nikos", "Odette", "Pilar", "Quentin",
+    "Rosa", "Stefan", "Talia", "Umar", "Violet", "Willa", "Ximena", "Yusuf", "Zelda", "Arjun", "Beatriz", "Cyrus",
 ]
 
 LAST_NAMES = [
     "Patel", "Reed", "Carter", "Shaw", "Rivera", "Bennett", "Morris", "Nguyen", "Coleman", "Santos",
     "Brooks", "Foster", "Hayes", "Ward", "Bailey", "Kim", "Murphy", "Price", "Diaz", "Powell",
+    "Okafor", "Lindqvist", "Haddad", "Moreau", "Tanaka", "Novak", "Silva", "Andersson", "Rossi", "Kowalski", "Mbeki",
+    "Fischer", "Castillo", "Yilmaz", "Dubois", "Nakamura", "Petrov", "Larsen", "Mendez", "Ibrahim", "Rahman", "Cohen",
+    "Oliveira", "Schneider", "Volkov", "Adeyemi", "Chen", "Gupta", "Hoang", "Jensen", "Khalil", "Lopez", "Mori",
+    "Nasser", "Ortiz", "Park", "Quispe", "Romero", "Sato", "Tran", "Usman", "Vargas", "Weiss", "Xu", "Yamada",
+    "Zhang", "Abbott", "Barros", "Cruz", "Dalton", "Eriksen", "Fontaine", "Grimaldi", "Holm", "Ivanov", "Jovanovic",
+    "Keller", "Laurent", "Moretti", "Navarro", "Olsen", "Pereira", "Quintero", "Ramos", "Stein", "Torres", "Underwood",
+    "Vasquez", "Whitfield", "Yoon", "Zielinski", "Alvarez", "Becker", "Costa", "Dimitrov", "Eze", "Farouk", "Garcia",
 ]
 
 
@@ -203,6 +219,7 @@ class Person:
         self.age = age if age is not None else rng.randint(0, 72)
         self.alive = True
         self.incarcerated = False
+        self.care_tile: Optional[Tuple[int, int]] = None
         self._schedule_day_index = 0
         self.tile_scale = float(getattr(world, "tile_scale", 1.0))
         self._route = None
@@ -272,7 +289,8 @@ class Person:
         self.job_performance = clamp(0.45 + rng.uniform(-0.12, 0.12), 0.0, 1.0)
         self.job_satisfaction = clamp(0.5 + rng.uniform(-0.18, 0.18), 0.0, 1.0)
         self.days_unproductive = 0
-        self.vehicle = rng.choice(["none", "bike", "car", "bus_pass"])
+        self.vehicle = rng.choice(["none", "bike", "car", "bus_pass"]) if self.age >= 18 else (
+            rng.choice(["none", "bike"]) if self.age >= 10 else "none")
         if self.age < 18:
             self.cash = round(rng.uniform(10.0, 80.0), 2)
             self.bank_balance = 0.0
@@ -299,7 +317,6 @@ class Person:
         self.gossip_log: List[str] = []
         self.life_stage = self._derive_life_stage()
         self._daily_targets: Dict[str, Tuple[Optional[Tuple[int, int]], Optional[int]]] = {}
-        self.add_memory("origin", f"Born into the procedural city at age {self.age}.", 0.15)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -361,9 +378,23 @@ class Person:
     def _plan_hour(self, world: WorldMap, day_index: int, hour: int) -> ScheduleBlock:
         if self.incarcerated:
             return ScheduleBlock(hour, hour + 1, "rest", target=self.location, intensity=0.1)
-        home_tile = self.home_tile(world)
-        if self._should_sleep(hour):
-            return ScheduleBlock(hour, hour + 1, "sleep", target=home_tile, building_id=self.home_building_id, intensity=0.2)
+        if self.care_tile is not None:
+            return ScheduleBlock(hour, hour + 1, "rest", target=self.care_tile, intensity=0.1)
+        bid = self.home_building_id
+        cache = self._home_cache
+        home_tile = cache[1] if (cache[0] == bid and bid is not None) else self.home_tile(world)
+        # == self._should_sleep(hour), inlined ==
+        on_shift = False
+        if self.job_company_id is not None:
+            start, end = self.job_shift
+            if start != end:
+                on_shift = (hour >= start or hour < end) if end < start else (start <= hour < end)
+        if not on_shift:
+            energy = self.energy
+            if (hour >= 23 or hour <= 5 or energy < 0.14
+                    or (self.hours_since_rest >= 20 and energy < 0.35)
+                    or (self.stress > 0.88 and energy < 0.45)):
+                return ScheduleBlock(hour, hour + 1, "sleep", target=home_tile, building_id=bid, intensity=0.2)
         if self.infection_state == 2 and self.person_id % 3 != 0:
             # Symptomatic: stay home, or seek hospital care when seriously ill.
             if self.health < 0.4 and 7 <= hour <= 21:
@@ -373,7 +404,7 @@ class Person:
                     self._daily_targets["clinic"] = cached
                 return ScheduleBlock(hour, hour + 1, "clinic", target=cached[0], intensity=0.3)
             return ScheduleBlock(hour, hour + 1, "rest", target=home_tile, building_id=self.home_building_id, intensity=0.2)
-        weekday = (day_index + 3) % 7
+        weekday = 6 if getattr(world, "holiday", False) else (day_index + 3) % 7
         work_tile = self.work_tile(world)
         school_tile = self.school_tile(world)
 
@@ -445,18 +476,25 @@ class Person:
         school_tile: Optional[Tuple[int, int]],
         weekday: int = 0,
     ) -> Optional[ScheduleBlock]:
+        # _commute_lead_hours is pure (no RNG, no state change), so it is only
+        # evaluated where its value is actually used.
         if self.student_status and school_tile and self.energy > 0.08 and weekday < 5:
-            lead = self._commute_lead_hours(school_tile)
             if 8 <= hour < 14:
                 activity = "commute_school" if self.location != school_tile else "study"
                 return ScheduleBlock(hour, hour + 1, activity, target=school_tile, building_id=self.current_enrollment_building, intensity=0.8)
-            if self.location != school_tile and self._is_commute_time(hour, 8, lead):
+            if self.location != school_tile and self._is_commute_time(hour, 8, self._commute_lead_hours(school_tile)):
                 return ScheduleBlock(hour, hour + 1, "commute_school", target=school_tile, building_id=self.current_enrollment_building, intensity=0.7)
 
         if self.job_company_id and work_tile and (weekday < 5 or self._works_weekend(world, weekday)):
             shift_start, shift_end = self.job_shift
-            lead = self._commute_lead_hours(work_tile)
-            if self._hour_in_range(hour, shift_start, shift_end):
+            # == self._hour_in_range(hour, shift_start, shift_end), inlined ==
+            if shift_start == shift_end:
+                in_shift = False
+            elif shift_end < shift_start:
+                in_shift = hour >= shift_start or hour < shift_end
+            else:
+                in_shift = shift_start <= hour < shift_end
+            if in_shift:
                 if self.health < 0.16 or (self.energy < 0.08 and self.stress > 0.92):
                     return ScheduleBlock(hour, hour + 1, "rest", target=home_tile, building_id=self.home_building_id, intensity=0.5)
                 if (
@@ -467,7 +505,7 @@ class Person:
                     return ScheduleBlock(hour, hour + 1, "break", target=work_tile, intensity=0.3)
                 activity = "commute_work" if self.location != work_tile else "work"
                 return ScheduleBlock(hour, hour + 1, activity, target=work_tile, intensity=0.85)
-            if self.location != work_tile and self.energy > 0.22 and self._is_commute_time(hour, shift_start, lead):
+            if self.location != work_tile and self.energy > 0.22 and self._is_commute_time(hour, shift_start, self._commute_lead_hours(work_tile)):
                 return ScheduleBlock(hour, hour + 1, "commute_work", target=work_tile, intensity=0.6)
             if self._is_after_shift(hour, shift_start, shift_end) and self.location != home_tile:
                 return ScheduleBlock(hour, hour + 1, "commute_home", target=home_tile, building_id=self.home_building_id, intensity=0.45)
@@ -677,7 +715,7 @@ class Person:
         kind = 1 if self.mode in (MODE_CAR, MODE_BUS, MODE_TAXI) else 0
         self.set_route(world.find_route_array(self.location, target, max_steps=2000, kind=kind))
         self._acc = 0.0
-        self._delay = (self.person_id * 7) % 15
+        self._delay = (self.person_id * 7) % 6
         self._failed_target = None if self.has_path() else target
 
     def update_position_for_hour(self, world: WorldMap, hour: int) -> None:
@@ -722,6 +760,17 @@ class Person:
         self._wts = None
         self.last_major_event_day = day_index if self.stress > 0.82 or self.happiness < 0.2 else self.last_major_event_day
 
+    def hourly_position(self, world: WorldMap, day_index: int, hour: int) -> None:
+        if self._schedule_day_index != day_index:
+            self.schedule = {}
+            self._daily_targets = {}
+            self._schedule_day_index = day_index
+        block = self.schedule.get(hour)
+        if block is None:
+            block = self._plan_hour(world, day_index, hour)
+            self.schedule[hour] = block
+        self.update_position_for_hour(world, hour)
+
     def hourly_update(self, world: WorldMap, day_index: int, hour: int) -> None:
         if self._schedule_day_index != day_index:
             self.schedule = {}
@@ -731,8 +780,15 @@ class Person:
         if block is None:
             block = self._plan_hour(world, day_index, hour)
             self.schedule[hour] = block
-        activity = "rest" if self.incarcerated else block.activity
         self.update_position_for_hour(world, hour)
+        self.hourly_effects(world, day_index, hour)
+
+    def hourly_effects(self, world: WorldMap, day_index: int, hour: int) -> None:
+        block = self.schedule.get(hour)
+        if block is None:
+            block = self._plan_hour(world, day_index, hour)
+            self.schedule[hour] = block
+        activity = "rest" if self.incarcerated else block.activity
         self.refresh_floor(block)
         self._apply_activity_effects(activity)
         self._ambient_effects_from_location(world)
@@ -880,13 +936,19 @@ class Person:
         self.happiness = 0.0 if h < 0.0 else 1.0 if h > 1.0 else h
 
     def _maybe_generate_spontaneous_social_contact(self, world: WorldMap, day_index: int) -> None:
+        if self.age < 5:
+            return
         loc = self.location
         occupants = world.tiles[loc[1] % world.height][loc[0] % world.width].occupants
         if len(occupants) < 2:
             return
-        rng = self.rng
-        if rng.random() > 0.15:
+        if self.rng.random() > 0.15:
             return
+        self._spontaneous_contact(occupants, day_index)
+
+    def _spontaneous_contact(self, occupants: List[int], day_index: int) -> None:
+        """Second half of _maybe_generate_spontaneous_social_contact, after the 15% roll."""
+        rng = self.rng
         ordered = sorted(occupants)
         other_id = ordered[int(rng.random() * len(ordered))]
         if other_id == self.person_id:
@@ -1083,6 +1145,7 @@ class Person:
         return False
 
     def maybe_have_child(self, partner_id: int, next_person_id: int) -> Optional[Dict[str, Any]]:
+        return None   # conception and birth are handled by LifeSystem (pregnancy, genetics, hospitals)
         if self.gender != "woman" or self.incarcerated:
             return None
         if self.age < 22 or self.age > 42:
@@ -1394,6 +1457,7 @@ class Person:
             "delay": self._delay,
             "alive": self.alive,
             "incarcerated": self.incarcerated,
+            "care_tile": list(self.care_tile) if self.care_tile else None,
         }
 
     @classmethod
@@ -1481,6 +1545,8 @@ class Person:
         person.life_stage = data["life_stage"]
         person.alive = bool(data.get("alive", True))
         person.incarcerated = bool(data.get("incarcerated", False))
+        ct = data.get("care_tile")
+        person.care_tile = (int(ct[0]), int(ct[1])) if ct else None
         person._schedule_day_index = int(data.get("schedule_day_index", schedule_day_index))
         person.schedule = {
             int(hour): ScheduleBlock(
@@ -1518,6 +1584,9 @@ class Population:
         self.deaths_total = 0
         self.death_ages: List[int] = []
         self.last_commuters = 0
+        self.death_hooks: List[Any] = []
+        self._pop_gen = 0
+        self._slice_cache: Dict[int, Any] = {}
         self.price_level = 1.0
         self.last_segments: Dict[int, np.ndarray] = {}
         self.last_times: Dict[int, np.ndarray] = {}
@@ -1538,6 +1607,7 @@ class Population:
         for _ in range(size):
             person = Person(self._person_counter, self.rng, self.world, age=self._sample_initial_age())
             self.people[person.person_id] = person
+            self._pop_gen += 1
             self.world.register_population_position(person.person_id, *person.location)
             self._person_counter += 1
         self._assign_homes()
@@ -1647,7 +1717,16 @@ class Population:
             if abs(adults[0].age - adults[1].age) <= 18:
                 adults[0].set_spouse(adults[1])
         for minor in minors:
-            for parent in adults[:2]:
+            able = [a for a in adults if 16 <= a.age - minor.age <= 50]
+            if not able:
+                continue                                  # no plausible parent in the house: a ward or relative
+            first = able[0]
+            parents = [first]
+            for other in able[1:]:
+                if other.gender != first.gender and first.spouse_id == other.person_id:
+                    parents.append(other)                # two parents only if a married man and woman
+                    break
+            for parent in parents[:2]:
                 minor.add_parent(parent)
         for member in members:
             for other in members:
@@ -1877,7 +1956,7 @@ class Population:
         schools = self.world.building_by_type("school")
         colleges = self.world.building_by_type("college")
         for person in self.people.values():
-            if person.age < 18 and schools:
+            if 5 <= person.age < 18 and schools:
                 school = self.rng.choice(schools)
                 person.student_status = "school"
                 person.current_enrollment_building = school.building_id
@@ -1906,9 +1985,9 @@ class Population:
                     rel.last_interaction_day = 0
                     if other_id not in person.social_circle:
                         person.social_circle.append(other_id)
-            district_candidates = self._district_social_candidates(person, limit=10)
+            district_candidates = [] if person.age < 5 else self._district_social_candidates(person, limit=10)
             for other_id in district_candidates:
-                if other_id == person.person_id:
+                if other_id == person.person_id or self.people[other_id].age < 5:
                     continue
                 rel = person.relationship_with(other_id)
                 rel.affinity = self.rng.uniform(-0.2, 0.65)
@@ -1945,15 +2024,120 @@ class Population:
         for person in self.people.values():
             person.hourly_update(self.world, day_index, hour)
 
-    def plan_hour(self, day_index: int, hour: int) -> None:
+    def _slice(self, j: int, k: int) -> List["Person"]:
+        cached = self._slice_cache.get(k)
+        if cached is None or cached[0] != self._pop_gen or cached[1] != len(self.people):
+            buckets: List[List["Person"]] = [[] for _ in range(k)]
+            for p in self.people.values():
+                buckets[p.person_id % k].append(p)
+            cached = (self._pop_gen, len(self.people), buckets)
+            self._slice_cache[k] = cached
+        # Every add/remove of a citizen bumps _pop_gen, so a cache that survived the
+        # check above holds exactly the living members of each bucket.  Callers only
+        # iterate the list; it must not be mutated.
+        return cached[2][j]
+
+    def plan_slice(self, day_index: int, hour: int, j: int, k: int) -> None:
+        """Plan + enrol one 1/k share of the population (id % k == j).  Spreading
+        the hour-start work over several sub-steps removes the periodic stall and
+        also staggers departures like real commuters.
+
+        Equivalent to plan_hour(subset) followed by Person.hourly_position for each
+        member, fused into two tight loops (same per-person order, same RNG draws)."""
+        subset = self._slice(j, k)
+        self.plan_hour(day_index, hour, subset, accumulate=j > 0)
+        world = self.world
+        people = self.people
+        movers_add = world.movers.add
+        for person in subset:
+            if person.person_id not in people:
+                continue
+            block = person.schedule.get(hour) if person._schedule_day_index == day_index else None
+            if block is None:
+                person.hourly_position(world, day_index, hour)   # rare: slow general path
+                continue
+            # == Person.update_position_for_hour, inlined ==
+            target = block.target
+            if target:
+                if person.location != target and person._route is None and person._failed_target != target:
+                    person.set_destination(target, world, hour)
+                elif person.destination != target:
+                    person.set_destination(target, world, hour)
+                if person._route is not None and person.location != person.destination:
+                    movers_add(person.person_id)
+            else:
+                person.destination = person.location
+                person._route = None
+                person._route_i = 0
+
+    def effects_slice(self, day_index: int, hour: int, j: int, k: int) -> None:
+        """Hourly needs effects for one 1/k share; Person.hourly_effects inlined
+        (refresh_floor, ambient effects and the social-contact pre-checks)."""
+        world = self.world
+        amb_stress = world._amb_stress
+        amb_happy = world._amb_happy
+        W = world.width
+        H = world.height
+        tiles = world.tiles
+        for person in self._slice(j, k):
+            block = person.schedule.get(hour)
+            if block is None:
+                block = person._plan_hour(world, day_index, hour)
+                person.schedule[hour] = block
+            activity = "rest" if person.incarcerated else block.activity
+            loc = person.location
+            # -- refresh_floor(block) --
+            target = block.target
+            b_act = block.activity
+            if target is None or loc != target:
+                person.floor = -1
+            elif b_act == "socialize" or b_act == "exercise":
+                person.floor = -1
+            elif b_act == "work":
+                person.floor = person.work_floor
+            elif block.building_id is not None and block.building_id == person.home_building_id:
+                person.floor = person.home_floor
+            elif b_act == "study":
+                person.floor = 1 + person.person_id % 3
+            else:
+                person.floor = 0
+            person._apply_activity_effects(activity)
+            # -- _ambient_effects_from_location(world) --
+            x = loc[0]
+            y = loc[1]
+            i = (y % H) * W + (x % W)
+            stress = person.stress + amb_stress[i]
+            person.stress = 0.0 if stress < 0.0 else 1.0 if stress > 1.0 else stress
+            h = person.happiness + amb_happy[i]
+            person.happiness = 0.0 if h < 0.0 else 1.0 if h > 1.0 else h
+            # -- _maybe_generate_spontaneous_social_contact pre-checks --
+            if person.age < 5:
+                continue
+            occupants = tiles[y % H][x % W].occupants
+            if len(occupants) < 2:
+                continue
+            if person.rng.random() > 0.15:
+                continue
+            person._spontaneous_contact(occupants, day_index)
+
+    def daily_slice(self, day_index: int, j: int, k: int) -> None:
+        dead: List[int] = []
+        for person in self._slice(j, k):
+            person.daily_update(self.world, day_index)
+            if self._mortality_roll(person):
+                dead.append(person.person_id)
+        if dead:
+            self.remove_people(dead)
+
+    def plan_hour(self, day_index: int, hour: int, people: Optional[List["Person"]] = None, accumulate: bool = False) -> None:
         """Single scheduling pass for the hour; batches all new route requests
         so the routing service can answer them with one parallel A* call."""
         pending: List[Person] = []
         requests: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
         kinds: List[int] = []
         world = self.world
-        commuters = 0
-        for person in self.people.values():
+        commuters = self.last_commuters if accumulate else 0
+        for person in (self.people.values() if people is None else people):
             if person._schedule_day_index != day_index:
                 person.schedule = {}
                 person._daily_targets = {}
@@ -1975,7 +2159,8 @@ class Population:
                 person._route = None
                 person._route_i = 0
                 continue
-            if person.destination != target or not person.has_path():
+            route = person._route
+            if person.destination != target or route is None or person._route_i >= route.shape[0]:
                 person.destination = target
                 if person._failed_target == target:
                     continue
@@ -1993,7 +2178,7 @@ class Population:
                     person._route = route
                     person._route_i = 0
                     person._acc = 0.0
-                    person._delay = (person.person_id * 7) % 15
+                    person._delay = (person.person_id * 7) % 6
                     person._failed_target = None
                     person.commute_minutes = route.shape[0] / max(1.0, mode_tph[person.mode]) * 60.0
                 else:
@@ -2018,43 +2203,12 @@ class Population:
         if i >= n:
             return None
         dt = 3600.0 / max(1.0, world.mode_tph[p.mode])
-        sig = world.signal_grid
-        t_abs = world.sim_seconds
-        px, py = loc
-        pts = [(px, py)]
-        times = [0.0]
-        t = -p._acc
-        blocked = False
-        while i < n:
-            x = int(route[i, 0])
-            y = int(route[i, 1])
-            jid = sig[y][x]
-            if jid and sig[py][px] != jid:
-                axis = 0 if x == px else 1
-                t0 = t if t > 0.0 else 0.0
-                wait = time_to_green(jid, axis, t_abs + t0)
-                if wait > 0.0:
-                    t_go = t0 + wait
-                    if t_go >= seconds:
-                        pts.append((px, py))
-                        times.append(seconds)
-                        blocked = True
-                        break
-                    pts.append((px, py))
-                    times.append(t_go)
-                    t = t_go
-            t_new = t + dt
-            if t_new > seconds:
-                break
-            px, py = x, y
-            pts.append((x, y))
-            times.append(t_new if t_new > 0.0 else 0.0)
-            t = t_new
-            i += 1
-        p._acc = 0.0 if (blocked or i >= n) else max(0.0, seconds - t)
-        p._route_i = i
-        p.location = (px, py)
-        return np.asarray(pts, dtype=np.int16), np.asarray(times, dtype=np.float32), i >= n
+        pts, times, i2, nx, ny, acc, finished = drive_vehicle(
+            route, i, int(loc[0]), int(loc[1]), p._acc, dt, seconds, signal_array(world), world.sim_seconds)
+        p._acc = acc
+        p._route_i = i2
+        p.location = (nx, ny)
+        return pts, times, finished
 
     def move_substep(self, hour: int = 12) -> Dict[int, np.ndarray]:
         """Advance every travelling citizen by one 2-minute sub-step along its route.
@@ -2071,8 +2225,24 @@ class Population:
             return segments
         people = self.people
         steps = world.mode_step
-        register = world.register_population_position
+        # world.register_population_position, inlined below (same list ops, same order)
+        locs = world.population_locations
+        tiles = world.tiles
+        W = world.width
+        H = world.height
         done: List[int] = []
+        # Drive all vehicles of this sub-step in one compiled batch.  Same selection
+        # rule as the vehicle branch below, same order; each vehicle's result depends
+        # only on its own state, so this equals driving them one by one in the loop.
+        vehicles = []
+        for pid in movers:
+            p = people.get(pid)
+            if p is not None and p._delay <= 0 and p._route is not None and p.mode >= MODE_CAR:
+                vehicles.append(p)
+        if vehicles:
+            drives = drive_batch(vehicles, np.asarray(world.mode_tph, dtype=np.float64),
+                                 signal_array(world), world.sim_seconds)
+        vi = 0
         for pid in movers:
             p = people.get(pid)
             if p is None:
@@ -2087,7 +2257,14 @@ class Population:
                 continue
             mode = p.mode
             if mode >= MODE_CAR:
-                result = self._drive_vehicle(p, world)
+                if vehicles[vi] is not p:     # invariant guard: both loops select identically
+                    raise RuntimeError("vehicle batch out of sync with mover order")
+                result = drives[vi]
+                vi += 1
+                if result is not None:
+                    vpts, vtimes, p._route_i, x, y, p._acc, finished = result
+                    p.location = (x, y)
+                    result = (vpts, vtimes, finished)
                 if result is None:
                     p._route = None
                     p._route_i = 0
@@ -2096,7 +2273,16 @@ class Population:
                 vpts, vtimes, finished = result
                 segments[pid] = vpts
                 times_out[pid] = vtimes
-                register(pid, p.location[0], p.location[1])
+                x, y = p.location
+                old = locs.get(pid)
+                if old:
+                    occ = tiles[old[1] % H][old[0] % W].occupants
+                    if pid in occ:
+                        occ.remove(pid)
+                occ = tiles[y % H][x % W].occupants
+                if pid not in occ:
+                    occ.append(pid)
+                locs[pid] = (x, y)
                 if finished:
                     p._route = None
                     p._route_i = 0
@@ -2127,7 +2313,15 @@ class Population:
             x = int(route[j, 0])
             y = int(route[j, 1])
             p.location = (x, y)
-            register(pid, x, y)
+            old = locs.get(pid)
+            if old:
+                occ = tiles[old[1] % H][old[0] % W].occupants
+                if pid in occ:
+                    occ.remove(pid)
+            occ = tiles[y % H][x % W].occupants
+            if pid not in occ:
+                occ.append(pid)
+            locs[pid] = (x, y)
             fatigue = MODE_FATIGUE[mode]
             if fatigue:
                 e = p.energy - fatigue * (j - i + 1)
@@ -2165,10 +2359,13 @@ class Population:
         pending_estates: List[Person] = []
         for person_id in person_ids:
             person = self.people.pop(person_id, None)
+            self._pop_gen += 1
             if person is None:
                 continue
             dead_ids.add(person_id)
             pending_estates.append(person)
+            for hook in self.death_hooks:
+                hook(person)
             self.world.remove_population_position(person_id)
             if person.job_company_id is not None:
                 company = self.world.companies.get(person.job_company_id)
@@ -2369,6 +2566,7 @@ class Population:
                 child.home_building_id = self.people[parent_id].home_building_id
             child.add_parent(self.people[parent_id])
         self.people[child.person_id] = child
+        self._pop_gen += 1
         self.world.register_population_position(child.person_id, *child.location)
         if child.household_id and child.household_id in self.households:
             self.households[child.household_id].member_ids.append(child.person_id)
@@ -2455,6 +2653,7 @@ class Population:
             if not person.alive:
                 continue
             population.people[int(pid)] = person
+            population._pop_gen += 1
             world.register_population_position(person.person_id, *person.location)
         rng_state = coerce_rng_state(data.get("rng_state"))
         if rng_state is not None:

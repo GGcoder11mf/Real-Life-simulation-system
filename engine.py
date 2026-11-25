@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import buildings as bldg
+from life import LifeSystem
+from realism import RealismSystem, holiday_name
 from analytics import CityAnalytics
 from dynamics import CityDynamics
 from entities import Person, Population
@@ -261,6 +263,10 @@ class SimulationEngine:
         labor_force, _, _ = self.population.labor_stats()
         self.world.calibrate_company_staffing(labor_force)
         self.systems = SimulationSystems(self.seed, self.world)
+        self.life = LifeSystem(self.seed, self.world)
+        self.life.register_all(self.population)
+        self.realism = RealismSystem(self.seed)
+        self._wire_life()
         self.dynamics = CityDynamics(self.seed, self.world)
         self.analytics = CityAnalytics()
         self._bootstrap_employment()
@@ -278,6 +284,9 @@ class SimulationEngine:
         self.tick_duration = 3.0     # wall-clock seconds per 2 simulated minutes (x40 real time)
         self.tick_counter = 0
         self.sub_counter = 0
+        self._next_slot = 0
+        self._daily_report: Dict[str, List[str]] = {}
+        self._daily_jobs: List[Any] = []
         self.autosave_interval_days = 7
         self.last_autosave_day = 0
         self.selected_person_id: Optional[int] = min(self.population.people) if self.population.people else None
@@ -431,29 +440,181 @@ class SimulationEngine:
         if self.paused:
             return {}
         cal = self.calendar
-        if cal.minute == 0:
-            self._run_hour_start()
+        slot = cal.minute // SUBSTEP_MINUTES
+        while self._next_slot <= slot:
+            slot_i = self._next_slot
+            self._next_slot += 1
+            self._run_slot(slot_i)
         self.world.sim_seconds = cal.day_index * 86400.0 + cal.hour * 3600.0 + cal.minute * 60.0
         segments = self.population.move_substep(cal.hour)
         self.sub_counter += 1
         cal.minute += SUBSTEP_MINUTES
         if cal.minute >= 60:
             cal.minute = 0
+            self._next_slot = 0
             self._finish_hour()
         return segments
 
-    def _run_hour_start(self) -> None:
+    # Hour work is sliced over the 30 sub-steps of the hour so every step costs
+    # about the same: planning/enrolment first (staggers departures), then
+    # per-person needs effects, then the global systems.
+    PLAN_SLICES = 14
+    EFFECT_SLICES = 12
+
+    def _run_slot(self, slot: int) -> None:
         current_hour = self.calendar.hour
         current_day = self.calendar.day_index
-        self.world.bad_weather = self.weather.condition in ("rain", "storm", "cold_snap")
+        pop = self.population
+        if slot == 0:
+            self.world.bad_weather = self.weather.condition in ("rain", "storm", "cold_snap")
+            self.world.holiday = bool(holiday_name(self.calendar))
         if current_hour == 0:
-            self._run_daily_cycle()
-        self.population.hourly_update(current_day, current_hour)
-        for text in self.dynamics.tick_hour(self, current_day, current_hour, self.population.last_commuters):
-            self.log_news("health", text, "Reported by the city health department.", 0.6)
-            self.log_timeline("health", text)
-        self._apply_weather_effects_hourly()
-        self._run_event_engine()
+            self._daily_slot(slot, current_day)
+        plan_n = self.PLAN_SLICES
+        if slot < plan_n:
+            pop.plan_slice(current_day, current_hour, slot, plan_n)
+        elif slot < plan_n + self.EFFECT_SLICES:
+            pop.effects_slice(current_day, current_hour, slot - plan_n, self.EFFECT_SLICES)
+        elif slot == plan_n + self.EFFECT_SLICES:
+            for text in self.dynamics.tick_hour(self, current_day, current_hour, pop.last_commuters):
+                self.log_news("health", text, "Reported by the city health department.", 0.6)
+                self.log_timeline("health", text)
+            self._apply_weather_effects_hourly()
+        else:
+            self._run_event_engine()
+
+    def fast_forward(self, days: int, progress: Any = None, hours_per_day_ticks: int = 4) -> None:
+        """Pre-simulate whole days without walking: the daily cycle (economy, health, births,
+        crime, markets, migration...) runs in full; movement and per-hour decisions are skipped.
+        Citizens end each day asleep at home, so the live simulation resumes cleanly at midnight."""
+        for d in range(days):
+            if self.calendar.hour != 0 or self.calendar.minute != 0:
+                self.flush_pending_slots()
+                while self.calendar.hour != 0:
+                    self.calendar.advance_hour()
+                self.calendar.minute = 0
+                self._next_slot = 0
+            day = self.calendar.day_index
+            self.world.holiday = bool(holiday_name(self.calendar))
+            self.world.bad_weather = self.weather.condition in ("rain", "storm", "cold_snap")
+            self.world.sim_seconds = day * 86400.0
+            self.world.movers.clear()
+            for slot in range(SUBSTEPS_PER_HOUR):
+                self._daily_slot(slot, day)
+            commuters = int(len(self.population.people) * 0.45)
+            for hour in range(0, 24, max(1, 24 // hours_per_day_ticks)):
+                for text in self.dynamics.tick_hour(self, day, hour, commuters if 6 <= hour <= 20 else 0):
+                    self.log_news("health", text, "Reported by the city health department.", 0.6)
+                self._apply_weather_effects_hourly()
+            self._run_event_engine()
+            for _ in range(24):
+                self.calendar.advance_hour()
+            self.weather = self.generate_weather()
+            self.tick_counter += 24
+            self.sub_counter += 24 * SUBSTEPS_PER_HOUR
+            self._next_slot = 0
+            if progress is not None:
+                progress(d + 1, days)
+        self._settle_citizens_home()
+
+    def _settle_citizens_home(self) -> None:
+        world = self.world
+        for p in self.population.people.values():
+            p._route = None
+            p._route_i = 0
+            p.schedule = {}
+            p._schedule_day_index = -1
+            if p.incarcerated:
+                tile = self.systems.law._prison_tile()
+            elif p.care_tile is not None:
+                tile = p.care_tile
+            else:
+                tile = p.home_tile(world) or p.location
+            p.location = tuple(tile)
+            p.destination = p.location
+            world.register_population_position(p.person_id, *p.location)
+        world.movers.clear()
+
+    def flush_pending_slots(self) -> None:
+        """Run any hour slots still outstanding (used before saving)."""
+        while self._next_slot < SUBSTEPS_PER_HOUR:
+            slot_i = self._next_slot
+            self._next_slot += 1
+            self._run_slot(slot_i)
+
+    def _daily_slot(self, slot: int, day_index: int) -> None:
+        if slot == 0:
+            self.world.tick_daily_world(day_index, self.population)
+            self._daily_report = {}
+            jobs = [("people", j) for j in range(6)]
+            jobs += [("job", f) for f in self.systems.daily_stages(self.population, day_index, self._daily_report)]
+            jobs += [("job", f) for f in self._life_stages(day_index)]
+            jobs += [("tail", i) for i in range(4)]
+            self._daily_jobs = jobs
+        if slot < len(self._daily_jobs):
+            kind, arg = self._daily_jobs[slot]
+            if kind == "people":
+                self.population.daily_slice(day_index, arg, 6)
+            elif kind == "job":
+                arg()
+            else:
+                self._daily_tail(arg, day_index)
+
+    def _life_stages(self, day_index: int):
+        life, pop, report = self.life, self.population, self._daily_report
+        report["life"] = []
+        out = report["life"]
+
+        def hospitals() -> None:
+            out.extend(life.stage_hospitals(pop, day_index))
+            self.dynamics.spending_today += life.hospitals.public_spend_today
+
+        stages = [
+            lambda: out.extend(life.stage_body(pop, day_index)),
+            hospitals,
+            lambda: out.extend(life.stage_pregnancy(pop, day_index)),
+            lambda: (out.extend(life.stage_marriages(pop, day_index)), out.extend(self.realism.tick(self, day_index))),
+            lambda: out.extend(life.stage_schools(pop, day_index)),
+        ]
+        for j in range(5):
+            stages.append(lambda j=j: out.extend(life.social_slice(pop, day_index, j, 5)))
+        return stages
+
+    def _daily_tail(self, stage: int, day_index: int) -> None:
+        report = self._daily_report
+        if stage == 0:
+            self.dynamics.revenue_today += self.systems.finance.tax_collected_today
+            self.dynamics.revenue_today += self.population.take_property_tax()
+            spending = self.population.take_consumer_spending()
+            if spending > 0:
+                self.dynamics.revenue_today += self.systems.company.receive_consumer_spending(spending)
+            for company in self.world.companies.values():
+                if company.public:
+                    company.cash = max(company.cash, company.payroll_budget * 4.0)
+            if day_index % 30 == 15:
+                self.population.run_property_market(day_index)
+            if day_index % 7 == 0 and bldg.refresh_structure(self.world):
+                bldg.reassign_work_floors(self.world, self.population)
+        elif stage == 1:
+            dynamics_report = self.dynamics.tick_daily(self, day_index)
+            self.population.price_level = self.dynamics.price_level
+            self.world.inflation_rate = self.dynamics.inflation
+            self.systems.law.safety_multiplier = self.dynamics.service["safety"]
+            self.systems.crime.safety_multiplier = self.dynamics.service["safety"]
+            for key, items in dynamics_report.items():
+                if items:
+                    report.setdefault(key, []).extend(items)
+            self.systems.company.seed_baseline_vacancies()
+            self.world.record_economy_snapshot(day_index, self.population)
+        elif stage == 2:
+            self.analytics.compute(self, day_index, len(report.get("crime", [])))
+            self._macro_metrics_cache_tick = -1
+        else:
+            self._ingest_system_report(report)
+            self._daily_story_events()
+            if day_index - self.last_autosave_day >= self.autosave_interval_days:
+                self.last_autosave_day = day_index
+                self.save(SAVE_FILE)
 
     def _finish_hour(self) -> None:
         self.calendar.advance_hour()
@@ -499,7 +660,7 @@ class SimulationEngine:
     def _ingest_system_report(self, report: Dict[str, List[str]]) -> None:
         for category, items in report.items():
             for text in items[:12]:
-                importance = 0.4 if category in {"hiring", "social", "crime", "courts", "health", "budget"} else 0.25
+                importance = 0.4 if category in {"hiring", "social", "crime", "courts", "health", "budget", "life"} else 0.25
                 self.log_news(category, text, f"Generated by {category} system.", importance)
                 self.log_timeline(category, text)
 
@@ -559,6 +720,8 @@ class SimulationEngine:
             "world": self.world.to_dict(),
             "population": self.population.to_dict(),
             "systems": self.systems.to_dict(),
+            "life": self.life.to_dict(),
+            "realism": self.realism.to_dict(),
             "dynamics": self.dynamics.to_dict(),
             "analytics": self.analytics.to_dict(),
             "news": [item.__dict__ for item in self.news],
@@ -568,6 +731,7 @@ class SimulationEngine:
             "tick_duration": self.tick_duration,
             "tick_counter": self.tick_counter,
             "sub_counter": self.sub_counter,
+            "next_slot": self._next_slot,
             "autosave_interval_days": self.autosave_interval_days,
             "last_autosave_day": self.last_autosave_day,
             "selected_person_id": self.selected_person_id,
@@ -601,6 +765,7 @@ class SimulationEngine:
         return pickle.loads(blob)
 
     def save(self, path: str) -> None:
+        self.flush_pending_slots()
         data = self.to_dict()
         payload = self._serialize_save_payload(data)
         with gzip.open(path, "wb", compresslevel=1) as handle:
@@ -611,6 +776,12 @@ class SimulationEngine:
         if value <= threshold:
             return value
         return threshold + math.log10(1.0 + value - threshold) * scale
+
+    def _wire_life(self) -> None:
+        life, population = self.life, self.population
+        population.death_hooks = [lambda person: life.on_death(population, person)]
+        self.systems.crime.life = life
+        self.systems.law.life = life
 
     def _stabilize_loaded_state(self) -> None:
         self.world.prune_empty_companies()
@@ -660,6 +831,13 @@ class SimulationEngine:
             schedule_day_index=engine.calendar.day_index,
         )
         engine.systems = SimulationSystems.from_dict(engine.seed, engine.world, data["systems"])
+        if data.get("life"):
+            engine.life = LifeSystem.from_dict(engine.seed, engine.world, data["life"])
+        else:
+            engine.life = LifeSystem(engine.seed, engine.world)
+            engine.life.register_all(engine.population)
+        engine.realism = RealismSystem.from_dict(engine.seed, data.get("realism", {}))
+        engine._wire_life()
         engine.dynamics = CityDynamics(engine.seed, engine.world)
         engine.dynamics.load_dict(data.get("dynamics", {}), engine.population)
         engine.analytics = CityAnalytics()
@@ -673,6 +851,9 @@ class SimulationEngine:
         engine.tick_duration = data.get("tick_duration", 3.0)
         engine.tick_counter = int(data.get("tick_counter", 0))
         engine.sub_counter = int(data.get("sub_counter", 0))
+        engine._daily_report = {}
+        engine._daily_jobs = []
+        engine._next_slot = int(data.get("next_slot", engine.calendar.minute // SUBSTEP_MINUTES))
         engine.autosave_interval_days = int(data.get("autosave_interval_days", 7))
         engine.last_autosave_day = int(data.get("last_autosave_day", 0))
         engine.selected_person_id = data.get("selected_person_id")
@@ -702,7 +883,7 @@ class SimulationEngine:
 
     def change_speed(self, faster: bool) -> None:
         if faster:
-            self.tick_duration = max(0.03, self.tick_duration * 0.7)
+            self.tick_duration = max(1e-4, self.tick_duration * 0.7)
         else:
             self.tick_duration = min(8.0, self.tick_duration * 1.4)
 

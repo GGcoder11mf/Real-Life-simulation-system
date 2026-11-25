@@ -102,13 +102,14 @@ WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MENU_DEFS = [
     ("View", [("Citizen", "tab:citizen"), ("Building Inspector", "tab:building"), ("Metrics", "tab:metrics"), ("Charts", "tab:charts"),
               ("City", "tab:city"), ("Health & Env", "tab:health"), ("News", "tab:news"),
-              ("Companies", "tab:companies"), ("Timeline", "tab:timeline"),
+              ("Companies", "tab:companies"), ("Society & Law", "tab:society"), ("Timeline", "tab:timeline"),
               ("Relationships", "tab:relationships"), ("Help", "tab:help"), ("Hide Panel", "tab:none")]),
     ("Map", [("Zoom In", "map:zoom_in"), ("Zoom Out", "map:zoom_out"), ("Center Citizen", "map:center"),
              ("Cycle Heatmap", "map:heat"), ("Cycle Citizen Colors", "map:color"),
              ("Toggle Minimap", "map:minimap"), ("Toggle Smooth Motion", "map:smooth")]),
     ("Sim", [("Pause/Resume", "sim:pause"), ("Faster", "sim:faster"), ("Slower", "sim:slower"),
-             ("Save", "sim:save"), ("Load", "sim:load")]),
+             ("Save", "sim:save"), ("Load", "sim:load"),
+             ("Pre-simulate 30 days", "sim:presim30"), ("Pre-simulate 1 year", "sim:presim365")]),
 ]
 
 
@@ -177,6 +178,11 @@ class Frontend:
         self.show_minimap = True
         self.smooth = True
         self.news_scroll = 0
+        self.play_T: Optional[float] = None
+        self.play_wall = 0.0
+        self.toasts: List[Tuple[str, float]] = []
+        self.seen_news: set = set()
+        self.seen_news_primed = False
         self.timeline_scroll = 0
         self.drag_pos: Optional[Tuple[int, int]] = None
         # static world
@@ -308,7 +314,7 @@ class Frontend:
         header_h, footer_h = 52, 36
         map_rect = pygame.Rect(10, header_h + 14, width - 20, height - header_h - footer_h - 26)
         panel_w = min(560, max(340, width // 3))
-        panel_rect = pygame.Rect(map_rect.right - panel_w - 8, map_rect.y + 8, panel_w, min(map_rect.height - 16, 760))
+        panel_rect = pygame.Rect(map_rect.right - panel_w - 8, map_rect.y + 62, panel_w, min(map_rect.height - 70, 740))
         return {
             "w": width, "h": height,
             "header": pygame.Rect(10, 8, width - 20, header_h),
@@ -549,10 +555,23 @@ class Frontend:
             if not self.zoom_initialised:
                 self.init_zoom(lay)
             self.draw_header(lay["header"], frame)
+            self.draw_speed_controls(lay["header"], frame)
             cur, u = self.display_state()
             self.draw_map(lay, frame, cur or frame, u)
+            self.draw_heat_legend(lay)
+            self.draw_tab_strip(lay)
             self.draw_panel_tab(lay, frame)
+            self.update_toasts(frame)
+            self.draw_toasts(lay)
+            self.draw_hover_tooltip(lay, frame)
             self.draw_footer(lay["footer"], frame)
+        if self.client.progress and frame is not None and self.static:
+            veil = pygame.Surface((lay["w"], lay["h"]), pygame.SRCALPHA)
+            veil.fill((4, 8, 12, 190))
+            self.screen.blit(veil, (0, 0))
+            msg = self.text("ui", self.client.status)
+            self.screen.blit(msg, (lay["w"] // 2 - msg.get_width() // 2, lay["h"] // 2 - 30))
+            self.draw_progress_bar(pygame.Rect(lay["w"] // 2 - 220, lay["h"] // 2, 440, 16))
         self.draw_menu_bar(lay["header"])
         pygame.display.flip()
         self.draw_ms = (time.perf_counter() - t0) * 1000.0
@@ -577,8 +596,22 @@ class Frontend:
         msg = self.client.status
         surf = self.text("ui", msg)
         self.screen.blit(surf, (cx - surf.get_width() // 2, cy + 64))
+        self.draw_progress_bar(pygame.Rect(body.centerx - 220, cy + 124, 440, 16))
         sub = self.text("small", "The simulation runs in a separate process; the window stays responsive.", TEXT_DIM)
         self.screen.blit(sub, (cx - sub.get_width() // 2, cy + 92))
+
+    def draw_progress_bar(self, rect: pygame.Rect) -> None:
+        prog = self.client.progress
+        if not prog:
+            return
+        done, total, eta = prog
+        pygame.draw.rect(self.screen, (18, 26, 36), rect, border_radius=8)
+        fill = rect.copy()
+        fill.width = max(6, int(rect.width * done / max(1, total)))
+        pygame.draw.rect(self.screen, ACCENT, fill, border_radius=8)
+        pygame.draw.rect(self.screen, PANEL_BORDER, rect, width=1, border_radius=8)
+        label = self.text("tiny", f"Day {done} of {total}   ~{eta / 60:.1f} min left", TEXT)
+        self.screen.blit(label, (rect.centerx - label.get_width() // 2, rect.bottom + 6))
 
     def draw_error(self, lay: Dict[str, Any]) -> None:
         body = self.draw_panel(lay["map"], "Simulation process error", alt=True)
@@ -608,7 +641,7 @@ class Frontend:
         if frame["paused"]:
             status += "  [PAUSED]"
         self.blit_text("small", self.fit("small", status, rect.width // 2 - 20), (rect.x + 12, rect.y + 9))
-        speed = 120.0 / max(0.03, frame.get("tick_duration", 1.2))
+        speed = 120.0 / max(1e-4, frame.get("tick_duration", 1.2))
         info = (f"FPS {self.fps_display:4.0f}  draw {self.draw_ms:4.1f}ms  |  sim x{speed:.0f} ({frame.get('step_ms', 0):4.0f}ms/step)"
                 f"  |  zoom {self.tile_size}px  heat:{HEATMAPS[self.heatmap]}  color:{COLOR_MODES[self.color_mode]}")
         surf = self.text("tiny", info, TEXT_DIM)
@@ -617,28 +650,39 @@ class Frontend:
     def display_state(self) -> Tuple[Optional[Dict[str, Any]], float]:
         """Pick the frame to display and how far through its motion we are.
 
-        Playback is delayed by ~1.6 frame intervals so the hourly decision step
-        (and any pipe jitter) never shows up as stutter."""
+        Playback runs on a steady *simulation-time* clock instead of frame arrival times, so
+        uneven step costs (hourly planning, commute peaks, daily stages) never become uneven
+        motion.  Each frame covers [sim_seconds, sim_seconds + 120 s]; the clock advances at the
+        configured speed, is gently sped up or slowed to keep ~2.5 frames buffered, and simply
+        holds the last frame if the simulation cannot keep up."""
         frames = self.client.timeline()
+        now = time.monotonic()
+        dt = min(0.25, max(0.0, now - self.play_wall)) if self.play_wall else 0.0
+        self.play_wall = now
         if not frames:
             return None, 1.0
-        last_t, last = frames[-1]
+        last = frames[-1][1]
         if last.get("paused") or len(frames) < 2:
+            self.play_T = None
             return last, 1.0
-        gaps = [frames[i + 1][0] - frames[i][0] for i in range(max(0, len(frames) - 8), len(frames) - 1)]
-        gaps = [g for g in gaps if g < 2.5] or [0.2]
-        interval = sorted(gaps)[len(gaps) // 2]
-        self.delay += (min(2.5, max(0.04, interval * 1.7)) - self.delay) * 0.05
-        target = time.monotonic() - self.delay
-        if target >= last_t:
-            return last, 1.0
-        if target <= frames[0][0]:
-            return frames[0][1], 0.0
-        for k in range(len(frames) - 1):
-            t0, t1 = frames[k][0], frames[k + 1][0]
-            if t0 <= target < t1:
-                return frames[k + 1][1], (target - t0) / max(1e-6, t1 - t0)
-        return last, 1.0
+        starts = [f.get("sim_seconds", 0.0) for _, f in frames]
+        newest_end = starts[-1] + 120.0
+        oldest = starts[0]
+        tick = max(1e-4, float(last.get("tick_duration", 1.2)))
+        rate = 120.0 / tick                                  # simulated seconds per wall second
+        target_buf = 120.0 * max(2.5, 0.14 / tick)           # at least ~140 ms of wall time buffered
+        if self.play_T is None or self.play_T > newest_end + 1.0 or self.play_T < oldest - 600.0:
+            self.play_T = max(oldest, newest_end - target_buf)
+        buf = newest_end - self.play_T
+        steer = max(-0.6, min(0.6, (buf - target_buf) / target_buf))
+        self.play_T += dt * rate * (1.0 + 0.5 * steer)
+        self.play_T = min(self.play_T, newest_end)
+        self.play_T = max(self.play_T, oldest)
+        T = self.play_T
+        for k in range(len(frames) - 1, -1, -1):
+            if starts[k] <= T:
+                return frames[k][1], min(1.0, max(0.0, (T - starts[k]) / 120.0))
+        return frames[0][1], 0.0
 
     def draw_map(self, lay: Dict[str, Any], latest: Dict[str, Any], cur: Dict[str, Any], u: float) -> None:
         rect = lay["map"]
@@ -770,13 +814,128 @@ class Frontend:
     # ------------------------------------------------------------------
     # Side panel
     # ------------------------------------------------------------------
+    TAB_STRIP = [("citizen", "Citizen"), ("building", "Building"), ("metrics", "Metrics"), ("charts", "Trends"),
+                 ("city", "City"), ("health", "Health"), ("news", "News"), ("companies", "Firms"),
+                 ("society", "Society"), ("timeline", "Timeline"), ("relationships", "Ties")]
+
+    def draw_tab_strip(self, lay: Dict[str, Any]) -> None:
+        panel = lay["panel"]
+        per_row = 6
+        bw = (panel.width - 5 * 4) // per_row
+        for i, (key, label) in enumerate(self.TAB_STRIP):
+            row, col = divmod(i, per_row)
+            r = pygame.Rect(panel.x + col * (bw + 4), panel.y - 56 + row * 26, bw, 22)
+            active = self.active_tab == key
+            hover = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.screen, (30, 46, 62) if active else (22, 30, 40) if hover else (14, 20, 28), r, border_radius=7)
+            pygame.draw.rect(self.screen, ACCENT if active else PANEL_BORDER, r, width=1, border_radius=7)
+            surf = self.text("tiny", label, TEXT if active else TEXT_DIM)
+            self.screen.blit(surf, (r.centerx - surf.get_width() // 2, r.centery - surf.get_height() // 2))
+            self.hit_rects.insert(0, (r, "tab:" + key))
+
+    def draw_speed_controls(self, header: pygame.Rect, frame: Dict[str, Any]) -> None:
+        x = header.right - 190
+        speed = 120.0 / max(1e-4, frame.get("tick_duration", 1.2))
+        specs = [("||" if not frame["paused"] else ">", "act:sim:pause"), ("-", "act:sim:slower"), ("+", "act:sim:faster")]
+        for label, tag in specs:
+            r = pygame.Rect(x, header.y + 12, 30, 28)
+            hover = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.screen, (30, 46, 62) if hover else (16, 22, 30), r, border_radius=8)
+            pygame.draw.rect(self.screen, PANEL_BORDER, r, width=1, border_radius=8)
+            surf = self.text("small", label, TEXT)
+            self.screen.blit(surf, (r.centerx - surf.get_width() // 2, r.centery - surf.get_height() // 2))
+            self.hit_rects.insert(0, (r, tag))
+            x += 34
+        self.blit_text("tiny", f"x{speed:,.0f}", (x + 2, header.y + 19), ACCENT)
+
+    TOAST_WORDS = ("born", "married", "died", "divorc", "arrest", "convict", "acquit", "founded", "moved to the city",
+                   "bankrupt", "outbreak", "dating", "broke up", "diagnos", "released", "hired by", "laid off")
+
+    def update_toasts(self, frame: Dict[str, Any]) -> None:
+        lines = frame.get("news_lines") or []
+        if not self.seen_news_primed:
+            self.seen_news = set(lines)
+            self.seen_news_primed = True
+            return
+        now = time.monotonic()
+        for line in lines:
+            if line in self.seen_news:
+                continue
+            self.seen_news.add(line)
+            low = line.lower()
+            if any(w in low for w in self.TOAST_WORDS) and len(self.toasts) < 12:
+                self.toasts.append((line, now))
+        if len(self.seen_news) > 400:
+            self.seen_news = set(lines)
+
+    def draw_toasts(self, lay: Dict[str, Any]) -> None:
+        now = time.monotonic()
+        self.toasts = [(t, born) for t, born in self.toasts if now - born < 9.0][-5:]
+        rect = lay["map"]
+        y = rect.bottom - 14
+        for text, born in reversed(self.toasts):
+            age = now - born
+            alpha = int(255 * min(1.0, (9.0 - age) / 1.5, age / 0.25 + 0.2))
+            surf = self.text("small", self.fit("small", text, 520), TEXT)
+            box = pygame.Surface((surf.get_width() + 24, surf.get_height() + 12), pygame.SRCALPHA)
+            pygame.draw.rect(box, (12, 18, 26, int(alpha * 0.88)), box.get_rect(), border_radius=9)
+            pygame.draw.rect(box, (*ACCENT, alpha), box.get_rect(), width=1, border_radius=9)
+            surf = surf.copy()
+            surf.set_alpha(alpha)
+            box.blit(surf, (12, 6))
+            y -= box.get_height() + 6
+            self.screen.blit(box, (rect.x + 14, y))
+
+    def draw_hover_tooltip(self, lay: Dict[str, Any], frame: Dict[str, Any]) -> None:
+        pos = pygame.mouse.get_pos()
+        rect = lay["map"]
+        if not rect.collidepoint(pos) or self.active_menu or self.last_agents is None or self.tile_size < 6:
+            return
+        for r, tag in self.hit_rects[:-1]:
+            if tag != "map" and tag != "minimap" and r.collidepoint(pos):
+                return
+        x0, y0, _, _ = self.view_geometry(lay)
+        wx = x0 + (pos[0] - rect.x) / self.tile_size
+        wy = y0 + (pos[1] - rect.y) / self.tile_size
+        agents_frame, agents = self.last_agents
+        d = (agents["x"] - wx) ** 2 + (agents["y"] - wy) ** 2
+        d = np.where(agents_frame["indoors"] == 0, d, 1e9)
+        i = int(np.argmin(d))
+        if d[i] > max(0.35, (14.0 / self.tile_size) ** 2):
+            return
+        from sim_protocol import ACTIVITIES
+        act = int(agents_frame["activity"][i])
+        lines = [f"Citizen #{int(agents_frame['ids'][i])}  age {int(agents_frame['age'][i])}",
+                 f"{'woman' if agents_frame['gender'][i] else 'man'}, {ACTIVITIES[min(act, len(ACTIVITIES) - 1)]}",
+                 f"mood {int(agents_frame['happy'][i]) * 100 // 255}%  stress {int(agents_frame['stress'][i]) * 100 // 255}%  health {int(agents_frame['health'][i]) * 100 // 255}%"]
+        w = max(self.text("tiny", s).get_width() for s in lines) + 20
+        box = pygame.Rect(min(pos[0] + 16, lay["w"] - w - 8), min(pos[1] + 16, lay["h"] - 70), w, 56)
+        pygame.draw.rect(self.screen, (10, 15, 21), box, border_radius=8)
+        pygame.draw.rect(self.screen, ACCENT, box, width=1, border_radius=8)
+        for k, s in enumerate(lines):
+            self.blit_text("tiny", s, (box.x + 10, box.y + 6 + k * 16), TEXT if k else ACCENT)
+
+    def draw_heat_legend(self, lay: Dict[str, Any]) -> None:
+        if self.heatmap == 0:
+            return
+        rect = lay["map"]
+        bar = pygame.Rect(rect.x + 14, rect.y + 14, 160, 10)
+        for i in range(bar.width):
+            t = i / bar.width
+            col = lerp_color((28, 70, 130), (240, 90, 60), t)
+            pygame.draw.line(self.screen, col, (bar.x + i, bar.y), (bar.x + i, bar.bottom))
+        pygame.draw.rect(self.screen, PANEL_BORDER, bar, width=1)
+        self.blit_text("tiny", f"{HEATMAPS[self.heatmap]}: low", (bar.x, bar.bottom + 3), TEXT_DIM)
+        high = self.text("tiny", "high", TEXT_DIM)
+        self.screen.blit(high, (bar.right - high.get_width(), bar.bottom + 3))
+
     def draw_panel_tab(self, lay: Dict[str, Any], frame: Dict[str, Any]) -> None:
         tab = self.active_tab
         if not tab:
             return
         rect = lay["panel"]
         titles = {"building": "Building", "citizen": "Citizen", "metrics": "City Metrics", "charts": "Trends", "city": "City & Economy",
-                  "health": "Health & Environment", "news": "News", "companies": "Companies",
+                  "health": "Health & Environment", "news": "News", "companies": "Companies", "society": "Society & Law",
                   "timeline": "Timeline", "relationships": "Relationships", "help": "Help"}
         body = self.draw_panel(rect, titles.get(tab, tab))
         if tab == "charts" or tab == "city":
@@ -802,7 +961,23 @@ class Frontend:
             y += line_height
 
     def tab_citizen(self, body: pygame.Rect, frame: Dict[str, Any]) -> None:
-        self.text_block(body, frame["selected_lines"])
+        lines = frame["selected_lines"]
+        y = body.y
+        if lines:
+            self.blit_text("ui", self.fit("ui", lines[0], body.width), (body.x, y), TEXT)
+            y += 28
+        for label, value in (frame.get("selected_stats") or {}).items():
+            self.blit_text("tiny", label, (body.x, y), TEXT_DIM)
+            bar = pygame.Rect(body.x + 86, y + 3, max(40, body.width - 140), 9)
+            frac = max(0.0, min(1.0, float(value)))
+            hue = frac if label != "Stress" else 1.0 - frac
+            pygame.draw.rect(self.screen, (18, 26, 36), bar, border_radius=4)
+            pygame.draw.rect(self.screen, lerp_color((220, 80, 70), (80, 200, 120), hue),
+                             pygame.Rect(bar.x, bar.y, max(2, int(bar.width * frac)), bar.height), border_radius=4)
+            self.blit_text("tiny", f"{frac * 100:3.0f}%", (bar.right + 6, y), TEXT)
+            y += 16
+        rest = pygame.Rect(body.x, y + 8, body.width, max(20, body.bottom - y - 8))
+        self.text_block(rest, lines[1:])
 
     def tab_building(self, body: pygame.Rect, frame: Dict[str, Any]) -> None:
         b = frame.get("building")
@@ -858,7 +1033,10 @@ class Frontend:
         self.text_block(body, frame["timeline_lines"], start=self.timeline_scroll)
 
     def tab_companies(self, body: pygame.Rect, frame: Dict[str, Any]) -> None:
-        self.text_block(body, frame["company_lines"] + [""] + frame["market_lines"])
+        self.text_block(body, ["-- Most influential companies --"] + frame["influence_lines"] + ["", "-- Companies --"] + frame["company_lines"] + [""] + frame["market_lines"])
+
+    def tab_society(self, body: pygame.Rect, frame: Dict[str, Any]) -> None:
+        self.text_block(body, frame["society_lines"])
 
     def tab_help(self, body: pygame.Rect, frame: Dict[str, Any]) -> None:
         self.text_block(body, [
@@ -1082,6 +1260,8 @@ class Frontend:
             self.client.send("save")
         elif action == "sim:load":
             self.client.send("load")
+        elif action.startswith("sim:presim"):
+            self.client.send("presim", int(action[len("sim:presim"):]))
 
     def center_selected(self) -> None:
         frame, _, _, _ = self.client.snapshot()
@@ -1138,6 +1318,12 @@ class Frontend:
             if rect.collidepoint(pos):
                 if tag == "close":
                     self.active_tab = None
+                    return
+                if tag.startswith("tab:"):
+                    self.execute(tag)
+                    return
+                if tag.startswith("act:"):
+                    self.execute(tag[4:])
                     return
                 if tag == "panel":
                     return
@@ -1314,13 +1500,15 @@ def main() -> None:
     parser.add_argument("--load", default=None, help="load a saved simulation file")
     parser.add_argument("--tick-ms", type=float, default=None,
                         help="wall-clock milliseconds per 2 simulated minutes (default 1200; lower = faster)")
+    parser.add_argument("--presim", type=int, default=0, metavar="DAYS",
+                        help="fast-forward the city by this many days before the window shows it (365 = one year)")
     parser.add_argument("--bench-frames", type=int, default=0, help="headless render benchmark")
     parser.add_argument("--shot", default="", help="with --bench-frames: save screenshots with this path prefix")
     args = parser.parse_args()
     config = {
         "preset": args.preset, "seed": args.seed, "world_seed": args.world_seed,
-        "load_path": args.load,
-        "tick_duration": args.tick_ms / 1000.0 if args.tick_ms else None,
+        "load_path": args.load, "presim_days": args.presim,
+        "tick_duration": args.tick_ms / 1000.0 if args.tick_ms is not None else None,
     }
     pygame.init()
     pygame.font.init()

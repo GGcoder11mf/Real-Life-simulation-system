@@ -14,32 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import buildings as bldg
 from entities import Person, Population
+from market import MarketSystem
+from justice import CrimeCase, CourtDocketItem, CrimeSystem, LawSystem
 from world import Company, WorldMap, clamp, coerce_rng_state
-
-
-@dataclass
-class CrimeCase:
-    case_id: int
-    suspect_id: int
-    district_id: int
-    severity: float
-    crime_type: str
-    evidence: float
-    witnesses: List[int] = field(default_factory=list)
-    resolved: bool = False
-    verdict: Optional[str] = None
-    sentence_days: int = 0
-    opened_day: int = 0
-    resolved_day: int = 0
-
-
-@dataclass
-class CourtDocketItem:
-    docket_id: int
-    case_id: int
-    hearing_day: int
-    judge_bias: float
-    public_attention: float
 
 
 @dataclass
@@ -324,6 +301,10 @@ class CompanySystem:
         """Distribute household spending to consumer-facing firms by size; returns the sales tax."""
         tax = amount * 0.06
         pool = amount - tax
+        market = getattr(self, "market", None)
+        if market is not None:
+            market.allocate(pool)
+            return tax
         weights = {
             c.company_id: len(c.employee_ids) * self.CONSUMER_SECTORS.get(c.sector, 0.0)
             for c in self.world.companies.values()
@@ -377,8 +358,8 @@ class CompanySystem:
             for _ in range(max(0, missing)):
                 posting = world.add_job_posting(
                     company,
-                    title=self._title_for_sector(company.sector),
-                    required_skill=self._skill_for_sector(company.sector),
+                    title=self._title_for_company(company),
+                    required_skill=self._skill_for_company(company),
                     salary=round(self.rng.uniform(2200, 9200), 2),
                     required_level=self.rng.uniform(0.1, 0.6),
                     shift=self.rng.choice(company.shift_templates or [(9, 17)]),
@@ -429,6 +410,8 @@ class CompanySystem:
     def run_layoffs_and_bankruptcy(self, population: Population) -> List[str]:
         events: List[str] = []
         for company in list(self.world.companies.values()):
+            if company.public:
+                continue
             employee_pool = [population.people[pid] for pid in company.employee_ids if pid in population.people]
             if employee_pool:
                 low_performers = sorted(employee_pool, key=lambda person: self._employee_performance_score(person, company))
@@ -514,9 +497,9 @@ class CompanySystem:
                     openings = min(hiring_gap, self.rng.randint(1, 2))
                 else:
                     openings = min(hiring_gap, self.rng.randint(3, 8))
-                skill = self._skill_for_sector(company.sector)
-                title = self._title_for_sector(company.sector)
+                skill = self._skill_for_company(company)
                 for _ in range(openings):
+                    title = self._title_for_company(company)
                     self.world.add_job_posting(
                         company,
                         title=title,
@@ -528,6 +511,17 @@ class CompanySystem:
                     )
                 events.append(f"{company.name} opened a hiring wave for {openings} positions.")
         return events
+
+    def _building_type(self, company: Company) -> str:
+        site = self.world.buildings.get(company.building_id)
+        return site.building_type if site is not None else ""
+
+    def _title_for_company(self, company: Company) -> str:
+        titles = self.world.CIVIC_TITLES.get(self._building_type(company))
+        return self.rng.choice(titles) if titles else self._title_for_sector(company.sector)
+
+    def _skill_for_company(self, company: Company) -> str:
+        return self.world.CIVIC_SKILLS.get(self._building_type(company)) or self._skill_for_sector(company.sector)
 
     def _skill_for_sector(self, sector: str) -> str:
         mapping = {
@@ -564,163 +558,6 @@ class CompanySystem:
         return self.rng.choice(table.get(sector, ["Worker"]))
 
 
-class CrimeSystem:
-    """Crime is driven by pressure, location, and personality."""
-
-    def __init__(self, seed: int, world: WorldMap) -> None:
-        self.rng = random.Random(seed + 705)
-        self.world = world
-        self.cases: Dict[int, CrimeCase] = {}
-        self._case_counter = 1
-        self.safety_multiplier = 1.0
-
-    def tick(self, population: Population, day_index: int) -> List[CrimeCase]:
-        opened: List[CrimeCase] = []
-        for person in population.people.values():
-            if person.incarcerated:
-                continue
-            tile = self.world.tile_at(*person.location)
-            pressure = person.crime_tendency * 0.45 + tile.crime_pressure * 0.35 + max(0.0, person.stress - 0.55) * 0.2
-            if person.cash + person.bank_balance < 150 and pressure > 0.45:
-                pressure += 0.08
-            if self.rng.random() < pressure * 0.008 / self.safety_multiplier:
-                crime_type = self.rng.choice(["theft", "fraud", "assault", "vandalism"])
-                case = CrimeCase(
-                    case_id=self._case_counter,
-                    suspect_id=person.person_id,
-                    district_id=tile.district_id,
-                    severity=clamp(pressure + self.rng.uniform(-0.15, 0.2), 0.1, 1.0),
-                    crime_type=crime_type,
-                    evidence=self.rng.uniform(0.1, 1.0),
-                    witnesses=[pid for pid in tile.occupants if pid != person.person_id][:5],
-                    opened_day=day_index,
-                )
-                self.cases[case.case_id] = case
-                self._case_counter += 1
-                person.hidden_karma = clamp(person.hidden_karma - 0.06, 0.0, 1.0)
-                person.gossip_log.append(f"Someone whispered that {person.full_name} was involved in {crime_type}.")
-                opened.append(case)
-        return opened
-
-
-class LawSystem:
-    """Police, courts, and prison interact with crime cases and reputation."""
-
-    def __init__(self, seed: int, world: WorldMap) -> None:
-        self.rng = random.Random(seed + 706)
-        self.world = world
-        self.docket: Dict[int, CourtDocketItem] = {}
-        self._docket_counter = 1
-        self.inmates: Dict[int, int] = {}
-        self.safety_multiplier = 1.0
-
-    def investigate(self, population: Population, crime_system: CrimeSystem, day_index: int) -> List[str]:
-        reports: List[str] = []
-        for case in crime_system.cases.values():
-            if case.resolved:
-                continue
-            suspect = population.people.get(case.suspect_id)
-            if suspect is None or suspect.incarcerated:
-                continue
-            detection_score = case.evidence * 0.45 + len(case.witnesses) * 0.08 + (1.0 - suspect.reputation_public) * 0.08
-            if self.rng.random() < detection_score * 0.3 * self.safety_multiplier:
-                docket = CourtDocketItem(
-                    docket_id=self._docket_counter,
-                    case_id=case.case_id,
-                    hearing_day=day_index + self.rng.randint(1, 10),
-                    judge_bias=self.rng.uniform(-0.2, 0.2),
-                    public_attention=clamp(case.severity + len(case.witnesses) * 0.05, 0.0, 1.0),
-                )
-                self.docket[docket.docket_id] = docket
-                self._docket_counter += 1
-                reports.append(f"Police referred case {case.case_id} ({case.crime_type}) to court.")
-        return reports
-
-    def resolve_courts(self, population: Population, crime_system: CrimeSystem, day_index: int) -> List[str]:
-        results: List[str] = []
-        for docket_id, docket in list(self.docket.items()):
-            if day_index < docket.hearing_day:
-                continue
-            case = crime_system.cases.get(docket.case_id)
-            if case is None or case.resolved:
-                del self.docket[docket_id]
-                continue
-            suspect = population.people.get(case.suspect_id)
-            if suspect is None:
-                del self.docket[docket_id]
-                continue
-            conviction = case.evidence * 0.55 + case.severity * 0.3 + docket.public_attention * 0.1 - suspect.reputation_public * 0.1 + docket.judge_bias
-            if conviction > 0.55:
-                sentence = int(2 + case.severity * 30)
-                case.verdict = "guilty"
-                case.sentence_days = sentence
-                self._incarcerate(suspect)
-                self.inmates[suspect.person_id] = sentence
-                suspect.arrest_record.append(f"{case.crime_type}:{sentence}d")
-                suspect.reputation_public = clamp(suspect.reputation_public - 0.12, 0.0, 1.0)
-                suspect.stress = clamp(suspect.stress + 0.12, 0.0, 1.0)
-                suspect.add_memory("law", f"Convicted for {case.crime_type}.", -0.18)
-                results.append(f"{suspect.full_name} was convicted for {case.crime_type} and sentenced to {sentence} days.")
-            else:
-                case.verdict = "not_guilty"
-                suspect.add_memory("law", f"A court cleared them in a {case.crime_type} case.", 0.02)
-                results.append(f"{suspect.full_name} was cleared in court for {case.crime_type}.")
-            case.resolved = True
-            case.resolved_day = day_index
-            del self.docket[docket_id]
-        self._tick_prison(population)
-        self._prune_cases(crime_system, day_index)
-        return results
-
-    def _incarcerate(self, person: Person) -> None:
-        person.incarcerated = True
-        if person.job_company_id is not None:
-            company = self.world.companies.get(person.job_company_id)
-            if company is not None and person.person_id in company.employee_ids:
-                company.employee_ids.remove(person.person_id)
-                company.payroll_budget = max(0.0, company.payroll_budget - person.salary / 12.0)
-            person.remove_job()
-        person.location = self._prison_tile()
-        person.destination = person.location
-        person.path = []
-        self.world.register_population_position(person.person_id, *person.location)
-
-    def _prune_cases(self, crime_system: CrimeSystem, day_index: int) -> None:
-        for case_id, case in list(crime_system.cases.items()):
-            if case.resolved and day_index - case.resolved_day > 60:
-                del crime_system.cases[case_id]
-            elif day_index - case.opened_day > 180:
-                del crime_system.cases[case_id]
-
-    def _tick_prison(self, population: Population) -> None:
-        for person_id in list(self.inmates.keys()):
-            person = population.people.get(person_id)
-            if person is None:
-                del self.inmates[person_id]
-                continue
-            self.inmates[person_id] -= 1
-            person.location = self._prison_tile()
-            person.destination = person.location
-            person.path = []
-            self.world.register_population_position(person.person_id, *person.location)
-            person.happiness = clamp(person.happiness - 0.01, 0.0, 1.0)
-            if self.inmates[person_id] <= 0:
-                del self.inmates[person_id]
-                person.incarcerated = False
-
-    def _prison_tile(self) -> Tuple[int, int]:
-        prisons = self.world.building_by_type("prison")
-        if prisons:
-            return prisons[0].tile
-        station = self.world.building_by_type("station")
-        return station[0].tile if station else (self.world.width // 2, self.world.height // 2)
-
-    def background_check_score(self, person: Person) -> float:
-        penalty = 0.25 if person.arrest_record else 0.0
-        debt_penalty = clamp(person.debt / 50_000.0, 0.0, 0.2)
-        return clamp(person.reputation_public - penalty - debt_penalty, 0.0, 1.0)
-
-
 class StockMarketSystem:
     """Simplified equities derived from company performance."""
 
@@ -730,8 +567,15 @@ class StockMarketSystem:
         self.stocks: Dict[str, Stock] = {}
         self._bootstrap()
 
+    @staticmethod
+    def listed(company: Company) -> bool:
+        """Only established private firms are publicly traded; indie shops and public bodies are not."""
+        return not company.public and company.company_scale != "indie" and company.max_headcount >= 20
+
     def _bootstrap(self) -> None:
         for company in self.world.companies.values():
+            if not self.listed(company):
+                continue
             self.stocks[company.stock_symbol] = Stock(
                 symbol=company.stock_symbol,
                 company_id=company.company_id,
@@ -754,6 +598,8 @@ class StockMarketSystem:
                 direction = "surged" if change > 0 else "fell"
                 events.append(f"{symbol} {direction} to {stock.price:.2f}.")
         for company in self.world.companies.values():
+            if not self.listed(company):
+                continue
             if company.stock_symbol not in self.stocks:
                 self.stocks[company.stock_symbol] = Stock(
                     symbol=company.stock_symbol,
@@ -831,6 +677,65 @@ class SimulationSystems:
         self.law = LawSystem(seed, world)
         self.stock_market = StockMarketSystem(seed, world)
         self.social = SocialEventSystem(seed)
+        self.market = MarketSystem(seed, world)
+        self.company.market = self.market
+
+    def daily_stages(self, population: Population, day_index: int, report: Dict[str, List[str]]):
+        """The daily system pass as separately schedulable stages (spread over
+        the first sub-steps of the day so no single step carries the whole cost)."""
+        for key in ("police", "courts", "crime", "taxes"):
+            report[key] = []
+
+        def crime_stage() -> None:
+            crime_cases = self.crime.tick(population, day_index)
+            if self.crime._pending_deaths:
+                victims = [pid for pid in self.crime._pending_deaths if pid in population.people]
+                self.crime._pending_deaths = []
+                if self.crime.life is not None:
+                    self.crime.life.deaths_by_cause["homicide"] = self.crime.life.deaths_by_cause.get("homicide", 0) + len(victims)
+                population.remove_people(victims)
+            report["crime"] = [
+                f"Crime reported: {population.people[case.suspect_id].full_name} linked to {case.crime_type}."
+                for case in crime_cases
+                if case.suspect_id in population.people
+            ]
+
+        def law_stage() -> None:
+            report["police"] = self.law.investigate(population, self.crime, day_index)
+            report["courts"] = self.law.resolve_courts(population, self.crime, day_index)
+            if day_index > 0 and day_index % 365 == 0:
+                report["taxes"] = self.finance.annual_tax_day(population)
+
+        def finance_stage() -> None:
+            report["finance"] = self.finance.process_daily_finances(population, day_index)
+
+        def education_stage() -> None:
+            report["education"] = self.education.tick(population, day_index)
+            report["enrollments"] = self.education.enroll_candidates(population, day_index)
+
+        def hiring_stage() -> None:
+            report["hiring"] = self.company.run_hiring(population)
+
+        def promo_stage() -> None:
+            report["promotions"] = self.company.run_promotions(population)
+            report["hiring_waves"] = self.company.spawn_hiring_waves()
+
+        def attrition_stage() -> None:
+            report["attrition"] = self.company.run_attrition(population)
+            report["layoffs"] = self.company.run_layoffs_and_bankruptcy(population)
+
+        def market_stage() -> None:
+            report["reputation"] = self.reputation.tick(population, day_index)
+            report["stock_market"] = self.stock_market.tick(population)
+
+        def market_daily_stage() -> None:
+            report["market"] = self.market.tick_daily(population, day_index)
+
+        def social_stage() -> None:
+            report["social"] = self.social.tick(population, self.world, day_index)
+
+        return [finance_stage, education_stage, hiring_stage, promo_stage, attrition_stage,
+                market_stage, market_daily_stage, social_stage, crime_stage, law_stage]
 
     def tick_daily(self, population: Population, day_index: int) -> Dict[str, List[str]]:
         report: Dict[str, List[str]] = {
@@ -875,8 +780,13 @@ class SimulationSystems:
             "docket": {did: item.__dict__ for did, item in self.law.docket.items()},
             "docket_counter": self.law._docket_counter,
             "inmates": self.law.inmates,
+            "justice": {
+                "custody": self.law.custody, "probation": self.law.probation, "law_stats": self.law.stats,
+                "rehab": self.law._rehab, "crime_stats": self.crime.stats, "by_type": self.crime.by_type,
+            },
             "stocks": {symbol: stock.__dict__ for symbol, stock in self.stock_market.stocks.items()},
             "gossip_feed": self.reputation.gossip_feed,
+            "market": self.market.to_dict(),
             "rng_states": {
                 "reputation": self.reputation.rng.getstate(),
                 "finance": self.finance.rng.getstate(),
@@ -900,8 +810,18 @@ class SimulationSystems:
         systems.law.docket = {int(did): CourtDocketItem(**item) for did, item in data["docket"].items()}
         systems.law._docket_counter = data["docket_counter"]
         systems.law.inmates = {int(pid): days for pid, days in data["inmates"].items()}
+        jd = data.get("justice", {})
+        systems.law.custody = {int(k): v for k, v in jd.get("custody", {}).items()}
+        systems.law.probation = {int(k): v for k, v in jd.get("probation", {}).items()}
+        systems.law.stats.update(jd.get("law_stats", {}))
+        systems.law._rehab = {int(k): v for k, v in jd.get("rehab", {}).items()}
+        systems.crime.stats.update(jd.get("crime_stats", {}))
+        systems.crime.by_type = dict(jd.get("by_type", {}))
         systems.stock_market.stocks = {symbol: Stock(**stock) for symbol, stock in data["stocks"].items()}
         systems.reputation.gossip_feed = list(data["gossip_feed"])
+        if data.get("market"):
+            systems.market = MarketSystem.from_dict(seed, world, data["market"])
+            systems.company.market = systems.market
         rng_states = data.get("rng_states", {})
         for name, system in {
             "reputation": systems.reputation,

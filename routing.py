@@ -201,23 +201,24 @@ def _astar_core(sx, sy, gx, gy, walkable, cost, max_steps, h_scale):  # pragma: 
 # Parallel batch A* (reuses per-thread buffers via a visit-stamp trick)
 # ---------------------------------------------------------------------------
 @njit(cache=True, parallel=True)
-def _astar_batch(sxs, sys_, gxs, gys, walkable, cost, h_scale, max_len, out, lens, nchunks):  # pragma: no cover - jit
+def _astar_batch(sxs, sys_, gxs, gys, walkable, cost, h_scale, max_len, out, lens, nchunks,
+                 pool_g, pool_stamp, pool_parent, pool_hf, pool_hg, pool_hi, stamp_ctr):  # pragma: no cover - jit
+    """Batch A*.  Chunk c serves requests c, c+nchunks, c+2*nchunks, ... (round-robin
+    for load balance) using pool row c, which persists across calls; the per-row
+    visit stamp keeps searches isolated, so each path depends only on its own
+    request -- results are identical for any chunking or pool reuse."""
     n = sxs.shape[0]
     H, W = walkable.shape
-    size = H * W
-    chunk = (n + nchunks - 1) // nchunks
     for c in prange(nchunks):
-        g = np.empty(size, dtype=np.float64)
-        stamp = np.zeros(size, dtype=np.int32)
-        parent = np.empty(size, dtype=np.int32)
-        heap_cap = 4 * size
-        heap_f = np.empty(heap_cap, dtype=np.float64)
-        heap_g = np.empty(heap_cap, dtype=np.float64)
-        heap_i = np.empty(heap_cap, dtype=np.int32)
-        cur = 0
-        lo = c * chunk
-        hi = min(n, lo + chunk)
-        for r in range(lo, hi):
+        g = pool_g[c]
+        stamp = pool_stamp[c]
+        parent = pool_parent[c]
+        heap_f = pool_hf[c]
+        heap_g = pool_hg[c]
+        heap_i = pool_hi[c]
+        heap_cap = heap_f.shape[0]
+        cur = stamp_ctr[c]
+        for r in range(c, n, nchunks):
             lens[r] = 0
             sx = sxs[r]
             sy = sys_[r]
@@ -328,6 +329,7 @@ def _astar_batch(sxs, sys_, gxs, gys, walkable, cost, h_scale, max_len, out, len
                 out[r, i, 1] = node // W
                 node = parent[node]
             lens[r] = length
+        stamp_ctr[c] = cur
 
 
 def astar_python(
@@ -590,6 +592,7 @@ class GPUGridRouter:
 @dataclass
 class RoutingStats:
     """Per-tier telemetry, surfaced in both frontends."""
+    # gpu_* = torch flow-field tier; cuda_* = CUDA A* kernel (cuda_routing.py)
 
     cache_hits: int = 0
     gpu_hits: int = 0
@@ -604,9 +607,13 @@ class RoutingStats:
     gpu_fields: int = 0
     gpu_device: str = "cpu"
     backend: str = "python"
+    cuda_hits: int = 0              # A* searches served by the CUDA kernel
+    cuda_mode: str = "off"          # off | cuda | hybrid (see cuda_routing.py)
+    cuda_device: str = "none"
+    cuda_note: Optional[str] = None
 
     def total(self) -> int:
-        return self.cache_hits + self.gpu_hits + self.numba_hits + self.python_hits
+        return self.cache_hits + self.gpu_hits + self.numba_hits + self.cuda_hits + self.python_hits
 
     def summary(self) -> str:
         total = max(1, self.total())
@@ -615,6 +622,7 @@ class RoutingStats:
             f"dev:{self.gpu_device}",
             f"gpu:{self.gpu_hits}",
             f"nb:{self.numba_hits}",
+            f"cuda[{self.cuda_mode}]:{self.cuda_hits}",
             f"py:{self.python_hits}",
             f"cache:{100 * self.cache_hits // total}%",
             f"fields:{self.gpu_fields}",
@@ -630,12 +638,28 @@ class RoutingStats:
 
 ROUTE_CACHE_LIMIT = 30000
 BATCH_MAX_PATH = 1024
+_STAMP_RESET_AT = 2_000_000_000
+
+
+def _make_astar_pool(rows: int, size: int) -> tuple:
+    """Per-thread A* scratch memory (g, stamp, parent, heap f/g/idx, stamp counters)."""
+    heap_cap = 4 * size
+    return (
+        np.empty((rows, size), dtype=np.float64),
+        np.zeros((rows, size), dtype=np.int32),
+        np.empty((rows, size), dtype=np.int32),
+        np.empty((rows, heap_cap), dtype=np.float64),
+        np.empty((rows, heap_cap), dtype=np.float64),
+        np.empty((rows, heap_cap), dtype=np.int32),
+        np.zeros(rows, dtype=np.int32),
+    )
 
 
 class RouteService:
     """Owns the routing arrays, accelerators, caches, and telemetry."""
 
-    def __init__(self, walkable: np.ndarray, cost: np.ndarray, vcost: Optional[np.ndarray] = None) -> None:
+    def __init__(self, walkable: np.ndarray, cost: np.ndarray, vcost: Optional[np.ndarray] = None,
+                 gpu_mode: Optional[str] = None) -> None:
         self.walkable = np.ascontiguousarray(walkable, dtype=np.bool_)
         self.cost = np.ascontiguousarray(cost, dtype=np.float32)
         self._cost64 = self.cost.astype(np.float64)
@@ -647,11 +671,19 @@ class RouteService:
         self._route_cache: "OrderedDict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[Tuple[int, int], ...]]" = OrderedDict()
         self._array_cache: "OrderedDict[Tuple[Tuple[int, int], Tuple[int, int]], np.ndarray]" = OrderedDict()
         self._batch_ok = False
-        self._n_threads = max(1, min(8, (os.cpu_count() or 2) - 1))
+        # Leave one hardware thread for the render process; the sim thread itself
+        # just waits on the kernel, so it does not need a core of its own.
+        self._n_threads = max(1, (os.cpu_count() or 2) - 1)
         self._numba_ok = False
+        self._astar_pool: Optional[tuple] = None
         self._gpu: Optional[GPUGridRouter] = None
+        self._cuda = None                # cuda_routing.CudaAStar when enabled
+        self._cuda_split = None          # cuda_routing.AdaptiveSplit (hybrid mode)
+        self._cuda_auto = False
+        self._cuda_batches = 0
         self._init_numba()
         self._init_gpu()
+        self._init_cuda(gpu_mode)
         self._refresh_backend()
 
     # -- accelerator init -------------------------------------------------
@@ -669,7 +701,8 @@ class RouteService:
                 out = np.zeros((2, 16, 2), dtype=np.int16)
                 lens = np.zeros(2, dtype=np.int32)
                 z = np.zeros(2, dtype=np.int32)
-                _astar_batch(z, z, z + 3, z + 3, small_w, small_c, 1.0, 16, out, lens, 2)
+                _astar_batch(z, z, z + 3, z + 3, small_w, small_c, 1.0, 16, out, lens, 2,
+                             *_make_astar_pool(2, small_w.size))
                 self._batch_ok = bool(lens[0] > 0)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Numba batch A* warmup failed")
@@ -691,6 +724,99 @@ class RouteService:
             self._gpu = None
             self.stats.gpu_error = f"{type(exc).__name__}: {exc}"
 
+    def _init_cuda(self, gpu_mode: Optional[str]) -> None:
+        """Optional CUDA A* (exactly the same paths as the CPU kernel; see cuda_routing.py)."""
+        try:
+            import cuda_routing
+        except Exception as exc:  # noqa: BLE001
+            self.stats.cuda_note = f"unavailable: {type(exc).__name__}: {exc}"
+            return
+        requested = (gpu_mode or os.environ.get("RLSS_GPU") or "auto").strip().lower()
+        mode = cuda_routing.resolve_mode(requested)
+        if mode == "off" or not self._batch_ok:
+            if requested not in ("off", "auto"):
+                self.stats.cuda_note = "no usable CUDA device" if self._batch_ok else "CPU batch kernel unavailable"
+            return
+        try:
+            self._cuda = cuda_routing.CudaAStar()
+            # Compile + validate on a tiny grid now, not mid-simulation.
+            small_w = np.ones((4, 4), dtype=np.bool_)
+            small_c = np.ones((4, 4), dtype=np.float64)
+            z = np.zeros(2, dtype=np.int32)
+            _, lens = self._cuda.run(z, z, z + 3, z + 3, small_w, small_c, 1.0, -1, 16)
+            if int(lens[0]) != 7:
+                raise RuntimeError(f"CUDA A* self-test returned length {int(lens[0])}")
+            self._cuda.invalidate()
+        except Exception as exc:  # noqa: BLE001 - must not kill the sim
+            logger.exception("CUDA A* init failed")
+            self._cuda = None
+            self.stats.cuda_note = f"init failed: {type(exc).__name__}: {exc}"
+            return
+        self.stats.cuda_mode = mode
+        self.stats.cuda_device = self._cuda.device_name
+        self._cuda_auto = requested == "auto"
+        if mode == "hybrid":
+            self._cuda_split = cuda_routing.AdaptiveSplit()
+
+    def _disable_cuda(self, note: str) -> None:
+        self._cuda = None
+        self._cuda_split = None
+        self.stats.cuda_mode = "off"
+        self.stats.cuda_note = note
+
+    def _astar_tier2(self, sx, sy, gx, gy, cost64, h_scale, kind: int):
+        """Run one A* batch on the CPU kernel, the GPU kernel, or both concurrently
+        (GPU kernels launch asynchronously, the CPU share runs meanwhile).  Every
+        search is independent and both kernels are identical, so where a search
+        runs never changes its path."""
+        m = sx.shape[0]
+        cuda_n = 0
+        if self._cuda is not None:
+            if self._cuda_split is None:
+                cuda_n = m
+            elif m >= 8:
+                cuda_n = int(round(m * self._cuda_split.gpu_share))
+        cpu_n = m - cuda_n
+        out = np.empty((m, BATCH_MAX_PATH, 2), dtype=np.int16)
+        lens = np.zeros(m, dtype=np.int32)
+        handle = None
+        t0 = time.perf_counter()
+        if cuda_n:
+            try:
+                handle = self._cuda.launch(sx[cpu_n:], sy[cpu_n:], gx[cpu_n:], gy[cpu_n:],
+                                           self.walkable, cost64, h_scale, kind, BATCH_MAX_PATH)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("CUDA A* launch failed")
+                self._disable_cuda(f"launch failed: {type(exc).__name__}: {exc}")
+                cuda_n, cpu_n = 0, m
+        t1 = time.perf_counter()
+        if cpu_n:
+            pool = self._astar_pool_for(self.walkable.size)
+            _astar_batch(sx[:cpu_n], sy[:cpu_n], gx[:cpu_n], gy[:cpu_n], self.walkable, cost64, h_scale,
+                         BATCH_MAX_PATH, out[:cpu_n], lens[:cpu_n], int(min(cpu_n, self._n_threads)), *pool)
+        t2 = time.perf_counter()
+        if handle is not None:
+            try:
+                g_out, g_lens = self._cuda.collect(handle)
+                out[cpu_n:] = g_out
+                lens[cpu_n:] = g_lens
+            except Exception as exc:  # noqa: BLE001 - recompute that share on the CPU
+                logger.exception("CUDA A* collect failed")
+                self._disable_cuda(f"collect failed: {type(exc).__name__}: {exc}")
+                pool = self._astar_pool_for(self.walkable.size)
+                _astar_batch(sx[cpu_n:], sy[cpu_n:], gx[cpu_n:], gy[cpu_n:], self.walkable, cost64, h_scale,
+                             BATCH_MAX_PATH, out[cpu_n:], lens[cpu_n:], int(min(cuda_n, self._n_threads)), *pool)
+                return out, lens, m
+            t3 = time.perf_counter()
+            split = self._cuda_split
+            if split is not None:
+                # The GPU ran from launch to collect; the CPU kernel ran t1..t2.
+                split.record(cuda_n, t3 - t0, cpu_n, t2 - t1)
+                self._cuda_batches += 1
+                if self._cuda_auto and self._cuda_batches >= 20 and split.gpu_share < 0.1:
+                    self._disable_cuda(f"auto: CUDA A* slower than the CPU kernel here ({split.summary()}); CPU only")
+        return out, lens, cpu_n
+
     def _refresh_backend(self) -> None:
         if self._gpu is not None:
             self.stats.gpu_device = self._gpu.device_name
@@ -699,6 +825,15 @@ class RouteService:
             self.stats.gpu_device = "none"
             self.stats.gpu_fields = 0
             self.stats.backend = "numba" if self._numba_ok else "python"
+
+    def _astar_pool_for(self, size: int) -> tuple:
+        pool = self._astar_pool
+        if pool is None or pool[0].shape[1] != size or pool[0].shape[0] < self._n_threads:
+            pool = self._astar_pool = _make_astar_pool(self._n_threads, size)
+        elif int(pool[6].max()) > _STAMP_RESET_AT:
+            pool[1].fill(0)
+            pool[6].fill(0)
+        return pool
 
     # -- cache / invalidation ---------------------------------------------
     def invalidate(self, walkable: Optional[np.ndarray] = None, cost: Optional[np.ndarray] = None, vcost: Optional[np.ndarray] = None) -> None:
@@ -716,6 +851,8 @@ class RouteService:
         self._route_cache.clear()
         self._array_cache.clear()
         self.stats.invalidations += 1
+        if self._cuda is not None:
+            self._cuda.invalidate()
         if self._gpu is not None:
             try:
                 self._gpu = GPUGridRouter(self.walkable, self.cost, max_fields=self._gpu.max_fields)
@@ -909,16 +1046,16 @@ class RouteService:
                 sy = np.fromiter((keys[i][0][1] for i in remaining), dtype=np.int32, count=m)
                 gx = np.fromiter((keys[i][1][0] for i in remaining), dtype=np.int32, count=m)
                 gy = np.fromiter((keys[i][1][1] for i in remaining), dtype=np.int32, count=m)
-                out = np.empty((m, BATCH_MAX_PATH, 2), dtype=np.int16)
-                lens = np.zeros(m, dtype=np.int32)
-                nchunks = int(min(max(1, m // 16), self._n_threads * 4))
-                _astar_batch(sx, sy, gx, gy, self.walkable, cost64, h_scale, BATCH_MAX_PATH, out, lens, nchunks)
+                out, lens, cpu_n = self._astar_tier2(sx, sy, gx, gy, cost64, h_scale, kind)
                 still = []
                 for j, i in enumerate(remaining):
                     length = int(lens[j])
                     if length > 0:
                         out_arrays[i] = out[j, :length].copy()
-                        self.stats.numba_hits += 1
+                        if j < cpu_n:
+                            self.stats.numba_hits += 1
+                        else:
+                            self.stats.cuda_hits += 1
                     else:
                         still.append(i)
                 remaining = still

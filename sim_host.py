@@ -13,6 +13,7 @@ frame rate is independent of population size and tick cost.
 
 from __future__ import annotations
 
+import gc
 import multiprocessing as mp
 import threading
 from collections import deque
@@ -51,8 +52,23 @@ def _host_loop(conn: Any, config: Dict[str, Any]) -> None:
         )
     if config.get("tick_duration") is not None:
         engine.tick_duration = float(config["tick_duration"])
-    engine.tick_duration = max(0.03, engine.tick_duration)
+    engine.tick_duration = max(1e-4, engine.tick_duration)
     engine.autosave_interval_days = int(config.get("autosave_days", engine.autosave_interval_days))
+    def run_presim(days: int) -> None:
+        t_start = time.perf_counter()
+
+        def progress(done: int, total: int) -> None:
+            elapsed = time.perf_counter() - t_start
+            eta = elapsed / max(1, done) * (total - done)
+            conn.send(("progress", (done, total, eta)))
+            conn.send(("status", f"Pre-simulating day {done}/{total}  (about {eta / 60:.1f} min left)"))
+
+        conn.send(("progress", (0, days, 0.0)))
+        engine.fast_forward(days, progress)
+        conn.send(("progress", None))
+
+    if int(config.get("presim_days", 0) or 0) > 0:
+        run_presim(int(config["presim_days"]))
     build_s = time.perf_counter() - t0
 
     static_version = 1
@@ -72,7 +88,14 @@ def _host_loop(conn: Any, config: Dict[str, Any]) -> None:
         conn.send(("frame", frame))
 
     publish_static()
-    publish_frame()
+    publish_frame(0.0, None, True)
+    # Garbage collection of millions of long-lived objects costs 100+ ms and shows up as
+    # a visible hitch.  Freeze the city we just built, stop automatic collections and
+    # run small collections ourselves while waiting for the next tick.
+    gc.collect()
+    gc.freeze()
+    gc.disable()
+    gc_steps = 0
     last_step = time.monotonic()
     sent_structure = getattr(engine.world, "structure_version", 0)
     last_day = engine.calendar.day_index
@@ -92,7 +115,27 @@ def _host_loop(conn: Any, config: Dict[str, Any]) -> None:
                 dirty = True
             elif name == "speed":
                 engine.change_speed(bool(cmd[1]))
-                status = f"Tick interval {engine.tick_duration * 1000:.0f} ms"
+                status = f"Tick interval {engine.tick_duration * 1000:.1f} ms"
+                dirty = True
+            elif name == "set_tick_duration":
+                engine.tick_duration = max(1e-4, float(cmd[1]))
+                speed_x = 120.0 / engine.tick_duration
+                status = f"Sim speed x{speed_x:.1f} ({engine.tick_duration:.3f}s per 2m)"
+                dirty = True
+            elif name == "presim":
+                try:
+                    engine.paused = False
+                    run_presim(int(cmd[1]))
+                    static_version += 1
+                    publish_static()
+                    last_day = engine.calendar.day_index
+                    sent_structure = getattr(engine.world, "structure_version", 0)
+                    status = f"Pre-simulated {int(cmd[1])} days."
+                except Exception as exc:  # noqa: BLE001
+                    status = f"Pre-simulation failed: {exc}"
+                    conn.send(("progress", None))
+                builder = FrameBuilder()
+                last_step = time.monotonic()
                 dirty = True
             elif name == "select":
                 if cmd[1] in engine.population.people:
@@ -128,7 +171,12 @@ def _host_loop(conn: Any, config: Dict[str, Any]) -> None:
                 tick_id += 1
                 publish_frame()
                 dirty = False
-            time.sleep(0.003)
+            if not engine.paused and gc_steps > 0:
+                gc_steps -= 1
+                gc.collect(1 if gc_steps % 8 == 0 else 0)
+            sleep_for = 0.003 if engine.paused else min(0.003, max(0.0, engine.tick_duration - (now - last_step)))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
             continue
         t = time.perf_counter()
         segments = engine.step_sub()
@@ -136,7 +184,11 @@ def _host_loop(conn: Any, config: Dict[str, Any]) -> None:
         last_step = max(last_step + engine.tick_duration, time.monotonic() - engine.tick_duration)
         tick_id += 1
         steps_done += 1
-        full = engine.calendar.minute == SUBSTEP_MINUTES
+        gc_steps = min(gc_steps + 1, 4000)
+        if gc_steps >= 4000:                     # never starved of idle time: collect anyway
+            gc.collect(1)
+            gc_steps = 2000
+        full = False
         if engine.calendar.day_index != last_day:
             last_day = engine.calendar.day_index
             conn.send(("layers", build_layers(engine)))
@@ -172,6 +224,7 @@ class SimClient:
         self.frame_time = 0.0
         self.frame_interval = 0.1
         self.status = "Starting simulation process..."
+        self.progress: Optional[Tuple[int, int, float]] = None
         self.fatal: Optional[str] = None
         self.frames_received = 0
         self._timeline: "deque" = deque(maxlen=24)
@@ -194,6 +247,7 @@ class SimClient:
                 break
             with self.lock:
                 if kind == "frame":
+                    payload = self._merge_frame(payload)
                     now = time.monotonic()
                     if self.frame is not None:
                         self.frame_interval = max(0.01, min(2.0, now - self.frame_time))
@@ -211,10 +265,32 @@ class SimClient:
                 elif kind == "daily":
                     self.daily = payload
                     self.daily_version += 1
+                elif kind == "progress":
+                    self.progress = payload
                 elif kind == "status":
                     self.status = payload
                 elif kind == "fatal":
                     self.fatal = payload
+
+    def _merge_frame(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Delta frames carry only moved citizens; rebuild the full arrays here."""
+        if not payload.get("delta"):
+            self._base = payload
+            return payload
+        base = getattr(self, "_base", None)
+        if base is None:
+            return payload
+        merged = dict(base)
+        merged.update(payload)
+        idx = payload["patch_idx"]
+        for key, vals in payload["patch"].items():
+            col = base[key].copy()
+            if idx.shape[0] and idx[-1] < col.shape[0]:
+                col[idx] = vals
+            merged[key] = col
+        merged.pop("delta", None)
+        self._base = merged
+        return merged
 
     def timeline(self):
         with self.lock:
